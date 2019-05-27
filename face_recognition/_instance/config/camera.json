@@ -1,7 +1,0 @@
-{
-  "data": {
-    "camera_id": 0,
-    "camera_close_key": "q",
-    "camera_frame_shape": [32, 32, 3]
-  }
-}
