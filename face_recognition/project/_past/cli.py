@@ -4,19 +4,19 @@ import os
 import sys
 import asyncio
 from argparse import ArgumentParser
-from typing import Mapping, Union
+from typing import Mapping, Union, Sequence, Hashable
 
 sys.path.append( os.path.abspath( os.path.join(os.path.dirname(__file__), '../..') ) )
-from face_recognition.project.core import ProcessingUtils, SystemUtils, CliUtils, DataUtils
+from face_recognition.project.core import TrainsetCreation, SystemUtils, CliUtils, DataUtils
 from face_recognition.project.schema import SCHEMA_MAPPING
 
 
 
 
-def _get_persons_flexible(data: str, persons: Union[Mapping, str], data_field: str, persons_field: str) -> Mapping:
+def _get_persons_flexible(data_path: str, data_fields: Sequence[Hashable], persons: Union[Mapping, str], persons_field: str) -> Mapping:
     """ Flexible get Persons Metadata """
-    if data:
-        persons = ProcessingUtils.get_meta_from_hdf5(data, data_field)
+    if data_path:
+        persons = TrainsetCreation.get_meta_from_hdf5_test(data_path, data_fields)
     else:
         persons = DataUtils.get_enumerate_mapping(CliUtils.mapping_flex_loader(persons), persons_field)
 
@@ -40,7 +40,7 @@ def main():
     if args['mode'] == 'fit':
         validate_results = CliUtils.chain_validate(args, schema_mapping=SCHEMA_MAPPING, data_slice_keys=['camera', 'persons'])
         if all(validate_results.values()):
-            model = ProcessingUtils.start_learn(
+            model = TrainsetCreation.create_datasets(
                 validate_results['persons']['data'],
                 validate_results['camera']['data'],
                 args['model_config_path'],
@@ -51,12 +51,12 @@ def main():
 
 
     elif args['mode'] == 'predict':
-        persons = _get_persons_flexible(args['data_path'], args['persons'], 'metadata', 'data')
+        persons = _get_persons_flexible(args['data_path'], 'data',  args['persons'], 'metadata')
         validate_args = {'persons': {'data': list(persons.values())}, 'camera': args['camera']}
         validate_results = CliUtils.chain_validate(validate_args, schema_mapping=SCHEMA_MAPPING, data_slice_keys=['camera', 'persons'])
 
         if all(validate_results.values()):
-            asyncio.run(ProcessingUtils.start_predict(
+            asyncio.run(TrainsetCreation.start_predict(
                 persons,
                 validate_results['camera']['data'],
                 args['model_save_path'],

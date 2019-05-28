@@ -7,7 +7,7 @@ from argparse import ArgumentParser
 from typing import Mapping, Union
 
 sys.path.append( os.path.abspath( os.path.join(os.path.dirname(__file__), '../..') ) )
-from face_recognition.project.core import ProcessingUtils, SystemUtils, CliUtils, DataUtils
+from face_recognition.project.core import TrainsetCreation, SystemUtils, CliUtils, DataUtils
 from face_recognition.project.schema import SCHEMA_MAPPING
 
 
@@ -16,7 +16,7 @@ from face_recognition.project.schema import SCHEMA_MAPPING
 def _get_persons_flexible(data: str, persons: Union[Mapping, str], data_field: str, persons_field: str) -> Mapping:
     """ Flexible get Pesons Metadata """
     if data:
-        persons = ProcessingUtils.get_meta_from_hdf5(data, data_field)
+        persons = TrainsetCreation.get_hdf5_data(data, data_field)
     else:
         persons = DataUtils.get_enumerate_mapping(CliUtils.mapping_flex_loader(persons), persons_field)
 
@@ -40,7 +40,7 @@ def main():
     if args['mode'] == 'fit':
         validate_results = CliUtils.chain_validate(args, schema_mapping=SCHEMA_MAPPING, data_slice_keys=['camera', 'persons'])
         if all(validate_results.values()):
-            model = ProcessingUtils.start_learn(
+            model = TrainsetCreation.create_datasets(
                 validate_results['persons']['data'],
                 validate_results['camera']['data'],
                 args['model_config_path'],
@@ -56,7 +56,7 @@ def main():
         validate_results = CliUtils.chain_validate(validate_args, schema_mapping=SCHEMA_MAPPING, data_slice_keys=['camera', 'persons'])
 
         if all(validate_results.values()):
-            asyncio.run(ProcessingUtils.start_predict(
+            asyncio.run(TrainsetCreation.start_predict(
                 persons,
                 validate_results['camera']['data'],
                 args['model_save_path'],
