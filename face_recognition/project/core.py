@@ -8,18 +8,20 @@ import asyncio
 import numpy as np
 import tensorflow as tf
 from pathlib import Path
-from itertools import starmap, repeat
+from itertools import starmap
 from functools import partial
 from sys import stderr, stdout
 from operator import itemgetter
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-from typing import Union, Tuple, Mapping, Sequence, Any, Iterable, List, Dict, Hashable, Callable, Generator
+from typing import Union, Tuple, Mapping, Sequence, Any, List, Dict, Hashable, Generator
 from jsonschema import Draft4Validator
 from keras.layers import deserialize
 from keras.models import Model, load_model
 from keras.utils import to_categorical
-from more_itertools import first, always_iterable, spy, collapse
+from more_itertools import first, always_iterable, spy
+from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS, UNIVERSAL_SOURCE_TYPE, UNIVERSAL_PATH_TYPE
+from face_recognition.project.type_hints import VALIDATE_RESUTS_TYPE, COORDS_TYPE, FRAME_SHAPE_TYPE
 
 tf.get_logger().setLevel(logging.ERROR)  ### Disable Tensorflow warning and other (non error) messages
 
@@ -48,14 +50,14 @@ class DataUtils:
     """ Utilities for general working with data in different formats and structures """
 
     @staticmethod
-    def dict_slice(d: Mapping, sliced_keys: Union[Union[int, str], Iterable[Union[int, str]]]) -> Mapping:
+    def dict_slice(d: Mapping, sliced_keys: ONE_MORE_KEYS) -> Mapping:
         """ Slice dict with keys """
         sliced_keys = tuple(always_iterable(sliced_keys))
         return { k: d[k] for k in d if k in sliced_keys }
 
 
     @staticmethod
-    def get_enumerate_mapping(d: Mapping[str, List[dict]], field_key: str = 'data') -> Mapping[int, dict]:
+    def get_enumerate_mapping(d: Mapping[str, List[dict]], field_key: Hashable = 'data') -> Mapping[int, dict]:
         """ Get enumerate mapping (like Labels-Mapping) for Json struct """
         return { str(k): v for k, v in enumerate(CliUtils.mapping_flex_loader(d, {}).get(field_key, [])) }
 
@@ -66,7 +68,7 @@ class CliUtils:
     """ Command line and validate tools """
 
     @staticmethod
-    def mapping_flex_loader(source: Union[Path, str, Mapping], default: Any = None, is_error_suppress: bool = False) -> Union[Mapping, Any]:
+    def mapping_flex_loader(source: UNIVERSAL_SOURCE_TYPE, default: Any = None, is_error_suppress: bool = False) -> Union[Mapping, Any]:
         """ Flexible get mapping from json file or Python Mapping
 
             :param source: Source file or Python Mapping object
@@ -100,7 +102,7 @@ class CliUtils:
 
 
     @staticmethod
-    def validate_json(schema_name: str, json_path: Union[Path, str], *, schema_mapping: Mapping) -> Tuple[str, Union[Mapping, None]]:
+    def validate_json(schema_name: str, json_path: Union[Path, str], *, schema_mapping: Mapping) -> VALIDATE_RESUTS_TYPE:
         """ Validate json file by schema
 
             :param schema_name: Schema name for access for JSON schema Mapping from <schema_mapping>
@@ -126,7 +128,7 @@ class CliUtils:
     def chain_validate(
         validate_data: Mapping[str, Any],
         schema_mapping: Mapping[str, str],
-        data_slice_keys: Union[int, str, Iterable[int], Iterable[str], None] = None
+        data_slice_keys: Union[ONE_MORE_KEYS, None] = None
 
     ) -> Mapping[str, Any]:
 
@@ -148,8 +150,8 @@ class CliUtils:
 class ImageWorking:
 
     @staticmethod
-    def draw_face_area(img, coords: Tuple[int, int, int, int]) -> None:
-        """ Draw face area
+    def draw_rect_area(img: np.array, coords: COORDS_TYPE) -> None:
+        """ Draw rectangle area
 
             :param img: Image
             :param coords: Rectangle coords [up_left_x, up_left_y, down_right_x, down_right_y]
@@ -158,7 +160,7 @@ class ImageWorking:
 
 
     @staticmethod
-    def resize_frame(img: np.array, *, new_shape: Tuple[int, ...]) -> np.array:
+    def resize_frame(img: np.array, *, new_shape: FRAME_SHAPE_TYPE) -> np.array:
         """ Resize image to fixed size """
         return cv2.resize(img, new_shape[:2], interpolation=cv2.INTER_AREA)
 
@@ -166,8 +168,8 @@ class ImageWorking:
     @staticmethod
     def extract_frame_area(
         img: np.array,
-        coords: Union[Tuple[int, int, int, int], None] = None,
-        frame_reshape: Union[Tuple[int, ...], None] = None,
+        coords: Union[COORDS_TYPE, None] = None,
+        frame_reshape: Union[FRAME_SHAPE_TYPE, None] = None,
         as_grayscale: bool = False
 
     ) -> np.array:
@@ -192,7 +194,6 @@ class ImageWorking:
     @staticmethod
     def get_faces_area(f_cascade: cv2.CascadeClassifier, colored_img: np.array, scaleFactor: float = 1.1) -> np.array:
         """ Return image with detected face into rectangle """
-
         frame_area = np.copy(colored_img)
         frame_area = cv2.cvtColor(frame_area, cv2.COLOR_BGR2GRAY)
         faces = f_cascade.detectMultiScale(frame_area, scaleFactor=scaleFactor, minNeighbors=5)
@@ -204,8 +205,9 @@ class ImageWorking:
 
 class LearnModel:
 
+    # noinspection PyTypeChecker
     @staticmethod
-    def prepare_model(d: Mapping, input_shape: Tuple[int, ...], n_classes: int) -> Mapping:
+    def prepare_model(d: Mapping, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> Mapping:
         """ Validate and prepare model if needed """
         dd = defaultdict(lambda: defaultdict(dict), **d)
         dd['config']['layers'][0]['batch_input_shape'] = [None, *input_shape]
@@ -280,7 +282,7 @@ class HDF5Utils:
 
     @staticmethod
     def hdf5_train_data_gen(
-        data_path: str,
+        data_path: Union[str, Path],
         X_field: str = 'X',
         y_field: str = 'y',
         batch_size: int = 200,
@@ -311,10 +313,10 @@ class HDF5Utils:
 
     @staticmethod
     def save_hdf5_train_images(
-        chunked_data,
-        metadata: Mapping,
-        image_shape,
-        storage_path: str = './data.hdf5',
+        chunked_data: CHUNKED_DATA_TYPE,
+        metadata: Mapping[str, Any],
+        image_shape: Tuple[int, ...],
+        data_path: Union[str, Path] = './data.hdf5',
         images_ds_name: str = 'X',
         labels_ds_name: str = 'y',
         metadata_ds_name: str = 'metadata'
@@ -325,7 +327,7 @@ class HDF5Utils:
 
         images, labels = zip(*chunked_data)
 
-        with h5py.File(storage_path, 'a') as hdf:
+        with h5py.File(data_path, 'a') as hdf:
             new_X_len, new_y_len = map(len, [images, labels])
             [group_label], group_labels = spy(labels)
             person_group_name = str(group_label)
@@ -397,7 +399,7 @@ class TrainsetCreation:
                     faces_coords = ImageWorking.get_faces_area(haar_face_cascade, frame)
                     if faces_coords.any():
                         first_face_coords = itemgetter(0, 1, 2, 3)(faces_coords[0])  ### Use first face only
-                        ImageWorking.draw_face_area(frame, first_face_coords)
+                        ImageWorking.draw_rect_area(frame, first_face_coords)
                         frame_area = ImageWorking.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape)
 
                         if shift > max_buffer_len:
@@ -457,15 +459,7 @@ class Processing:
 
 
     @staticmethod
-    def face_predict(
-        model,
-        label_mapping: Mapping,
-        frame: np.array,
-        extracted_face: np.array,
-        face_coords: Tuple[int, int, int, int]
-
-    ) -> None:
-
+    def face_predict(model, label_mapping: Mapping, frame: np.array, extracted_face: np.array, face_coords: COORDS_TYPE) -> None:
         """ Predict extracted face and draw label with this name """
 
         ### Predict label ###
@@ -473,7 +467,7 @@ class Processing:
         predicted_meta = label_mapping.get(str(first(predicted_code, None)), {})
 
         ### Draw face area ###
-        ImageWorking.draw_face_area(frame, face_coords)
+        ImageWorking.draw_rect_area(frame, face_coords)
 
         ### Draw person info ###
         for i, (k, v) in enumerate(predicted_meta.items()):
@@ -484,16 +478,18 @@ class Processing:
 
 
     @staticmethod
-    def start_learn(X, y, model_config_path, camera_frame_shape, n_classes):
-        """ Fit learn model from training dataset """
-        dummy_labels = to_categorical(y)
-        model = LearnModel.create_model(model_config_path, camera_frame_shape, n_classes)
-        return LearnModel.fit_model(model=model, X_train=X, Y_train=dummy_labels)
+    def start_learn(
+        generator,
+        model_config_path: UNIVERSAL_PATH_TYPE,
+        camera_frame_shape: FRAME_SHAPE_TYPE,
+        n_classes: int,
+        epoch: int = 1,
+        step_per_epoch: int = 1
 
+    ) -> Model:
 
-    @staticmethod
-    def start_learn_test(generator, model_config_path: Union[str, Path], camera_frame_shape, n_classes, epoch: int = 1, step_per_epoch: int = 1):
         """ Fit learn model from training dataset """
+
         model = LearnModel.create_model(model_config_path, camera_frame_shape, n_classes)
         return LearnModel.fit_model_gen(model=model, generator=generator, epochs=epoch, steps_per_epoch=step_per_epoch)
 
