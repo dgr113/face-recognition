@@ -20,7 +20,9 @@ from keras.layers import deserialize
 from keras.models import Model, load_model
 from keras.utils import to_categorical
 from more_itertools import first, always_iterable, spy
-from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS, UNIVERSAL_SOURCE_TYPE, UNIVERSAL_PATH_TYPE
+from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS, UNIVERSAL_SOURCE_TYPE
+from face_recognition.project.type_hints import TRAIN_DATA_GEN_TYPE, TRAIN_DATA_TYPE, TRAIN_LABELS_TYPE
+from face_recognition.project.type_hints import UNIVERSAL_PATH_TYPE, PERSONS_DATA_TYPE, CAMERA_DATA_TYPE, MODEL_CONFIG_TYPE
 from face_recognition.project.type_hints import VALIDATE_RESUTS_TYPE, COORDS_TYPE, FRAME_SHAPE_TYPE
 
 tf.get_logger().setLevel(logging.ERROR)  ### Disable Tensorflow warning and other (non error) messages
@@ -51,7 +53,7 @@ class DataUtils:
 
     @staticmethod
     def dict_slice(d: Mapping, sliced_keys: ONE_MORE_KEYS) -> Mapping:
-        """ Slice dict with keys """
+        """ Slice dict by keys """
         sliced_keys = tuple(always_iterable(sliced_keys))
         return { k: d[k] for k in d if k in sliced_keys }
 
@@ -66,6 +68,14 @@ class DataUtils:
 
 class CliUtils:
     """ Command line and validate tools """
+
+    @staticmethod
+    def get_meta_flexible(source: UNIVERSAL_SOURCE_TYPE, source_field: str = 'metadata') -> Mapping:
+        """ Flexible get Persons Metadata """
+        if isinstance(source, (str, Path)) and str(source).endswith('hdf5'):
+            source = HDF5Utils.get_hdf5_data(source, source_field)
+        return source
+
 
     @staticmethod
     def mapping_flex_loader(source: UNIVERSAL_SOURCE_TYPE, default: Any = None, is_error_suppress: bool = False) -> Union[Mapping, Any]:
@@ -205,19 +215,18 @@ class ImageWorking:
 
 class LearnModel:
 
-    # noinspection PyTypeChecker
     @staticmethod
-    def prepare_model(d: Mapping, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> Mapping:
+    def prepare_model(d: Mapping, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> MODEL_CONFIG_TYPE:
         """ Validate and prepare model if needed """
-        dd = defaultdict(lambda: defaultdict(dict), **d)
+        dd = defaultdict(lambda: defaultdict(dict), **d)  # type: dict
         dd['config']['layers'][0]['batch_input_shape'] = [None, *input_shape]
         dd['config']['layers'][-1]['units'] = n_classes
         return dict(dd)
 
 
     @staticmethod
-    def create_model(config_path: str, input_shape: Tuple[int, ...], n_classes: int) -> Model:
-        """ Create classify model """
+    def create_model(config_path: UNIVERSAL_PATH_TYPE, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> Model:
+        """ Compile classify model """
         with open(config_path,  'r') as f:
             model_config = LearnModel.prepare_model(json.load(f), input_shape, n_classes)
             model = deserialize(model_config)
@@ -226,17 +235,17 @@ class LearnModel:
 
 
     @staticmethod
-    def fit_model(model, X_train, Y_train, X_test=None, Y_test=None, batch_size: int = 256, epochs: int = 100, verbose_mode: bool = True) -> Model:
-        """ Train and return fitted model """
-        model.fit(X_train, Y_train, batch_size=batch_size, epochs=epochs, verbose=verbose_mode)
-        if X_test and Y_test:
-            model.evaluate(X_test, Y_test)
+    def fit_model_gen(
+        model: Model,
+        generator: TRAIN_DATA_GEN_TYPE,
+        X_test=TRAIN_DATA_TYPE,
+        Y_test=TRAIN_LABELS_TYPE,
+        epochs: int = 1,
+        steps_per_epoch: int = 1,
+        verbose_mode: bool = True
 
-        return model
+    ) -> Model:
 
-
-    @staticmethod
-    def fit_model_gen(model, generator, X_test=None, Y_test=None, epochs: int = 1, steps_per_epoch: int = 1, verbose_mode: bool = True) -> Model:
         """ Train and return fitted model """
         model.fit_generator(generator=generator, epochs=epochs, steps_per_epoch=steps_per_epoch, verbose=verbose_mode)
         if X_test and Y_test:
@@ -379,7 +388,7 @@ class TrainsetCreation:
         curr_label: int,
         person: Mapping,
         save_data_path: str,
-        max_buffer_len: int = 1E1,
+        max_buffer_len: int = 1E2,
         max_queue_size: int = 1E3
 
     ) -> None:
@@ -389,12 +398,13 @@ class TrainsetCreation:
         cam = cv2.VideoCapture(camera_id)
 
         with ProcessPoolExecutor(1) as pool:
-            tasks = []
-            chunked_data = deque()
+            tasks, chunked_data = deque(), deque()
             q = asyncio.Queue(maxsize=max_queue_size)
             try:
                 shift = 0
-                while True:
+                is_live = True
+                while is_live:
+                    is_live = not (cv2.waitKey(30) == ord(camera_close_key))  ### control of exit button pressing
                     _, frame = cam.read()
                     faces_coords = ImageWorking.get_faces_area(haar_face_cascade, frame)
                     if faces_coords.any():
@@ -402,7 +412,8 @@ class TrainsetCreation:
                         ImageWorking.draw_rect_area(frame, first_face_coords)
                         frame_area = ImageWorking.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape)
 
-                        if shift > max_buffer_len:
+                        ### If image buffer exceeds the limit or exit button is pressed - save the images asynchronously
+                        if (shift > max_buffer_len) or not is_live:
                             q.put_nowait(chunked_data.copy())
                             task = await asyncio.create_task(
                                 HDF5Utils.save_hdf5_train_images_async(save_data_path, q, camera_frame_shape, person, pool)
@@ -415,21 +426,24 @@ class TrainsetCreation:
                             chunked_data.append([frame_area, curr_label])
                             shift += 1
 
-                    if cv2.waitKey(30) == ord(camera_close_key):
-                        # task = asyncio.create_task(ProcessingUtils.save_task(loop, pool, q, person, camera_frame_shape, save_data_path))
-                        # tasks.append(task)
-                        break
-                    else:
-                        cv2.imshow('frame', frame)
+                    cv2.imshow('frame', frame)
 
             finally:
-                # results = await asyncio.gather(*tasks, return_exceptions=True)
+                ### Wait for all assigned async tasks to complete and then release all resources
+                await asyncio.gather(*tasks, return_exceptions=True)
                 cv2.destroyAllWindows()
                 cam.release()
 
 
     @staticmethod
-    def create_datasets(persons: Sequence[Mapping], camera: Mapping, haar_cascade_path: str, save_data_path: Union[str, None] = None) -> None:
+    def create_datasets(
+        persons: PERSONS_DATA_TYPE,
+        camera: CAMERA_DATA_TYPE,
+        haar_cascade_path: UNIVERSAL_PATH_TYPE,
+        save_data_path: UNIVERSAL_PATH_TYPE
+
+    ) -> None:
+
         """ Learn model by faces from camera """
 
         camera_id = camera['camera_id']
@@ -437,26 +451,17 @@ class TrainsetCreation:
         camera_close_key = camera['camera_close_key']
         haar_face_cascade = cv2.CascadeClassifier(haar_cascade_path)
 
-        for label, person in enumerate(persons):
+        for label, person in persons.items():
             inp_msg = "{0} {1}, are you ready? [Y/n]: ".format(*map(str.capitalize, always_iterable(itemgetter('first_name', 'last_name')(person))))
             inp_val = input(inp_msg)
             if inp_val.lower() == 'y':
-                asyncio.run(TrainsetCreation._create_stage_dataset(camera_id, camera_close_key, haar_face_cascade, camera_frame_shape, label, person, save_data_path))
+                asyncio.run(TrainsetCreation._create_stage_dataset(camera_id, camera_close_key, haar_face_cascade, camera_frame_shape, int(label), person, save_data_path))
 
 
 
 
 class Processing:
     """ Model learning and recognition processing """
-
-    @staticmethod
-    def _labels_prepare(labels: Union[Mapping[str, int], Sequence[str]]) -> Mapping[str, int]:
-        """ Prepare labels """
-        if isinstance(labels, Sequence):
-            labels = { k: i for k, i in enumerate(set(str(x).casefold() for x in labels)) }
-
-        return labels
-
 
     @staticmethod
     def face_predict(model, label_mapping: Mapping, frame: np.array, extracted_face: np.array, face_coords: COORDS_TYPE) -> None:

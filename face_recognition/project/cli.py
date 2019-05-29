@@ -4,35 +4,15 @@ import os
 import sys
 import asyncio
 from pathlib import Path
-from functools import partial
-from itertools import chain
-from operator import itemgetter
 from argparse import ArgumentParser
-from typing import Mapping, Union, Iterable, Any, Tuple, Sequence
+from pprint import pprint
+
 from more_itertools import ilen
 
 sys.path.append( os.path.abspath( os.path.join(os.path.dirname(__file__), '../..') ) )
-from face_recognition.project.type_hints import UNIVERSAL_SOURCE_TYPE
-from face_recognition.project.core import TrainsetCreation, SystemUtils, CliUtils, DataUtils, Processing, HDF5Utils
+from face_recognition.project.core import TrainsetCreation, SystemUtils, CliUtils, Processing, HDF5Utils
 from face_recognition.project.schema import SCHEMA_MAPPING
 
-
-
-
-def _get_persons_flexible(data: str, persons: UNIVERSAL_SOURCE_TYPE, data_field: str, persons_field: str) -> Mapping:
-    """ Flexible get Persons Metadata """
-    if data:
-        persons = HDF5Utils.get_hdf5_data(data, data_field)
-    else:
-        persons = DataUtils.get_enumerate_mapping(CliUtils.mapping_flex_loader(persons), persons_field)
-
-    return persons
-
-
-
-def zip_dataset(data: Iterable[Mapping[str, Any]]) -> Tuple[Sequence[Any], Sequence[Any]]:
-    X, y = map(tuple, map(chain.from_iterable, zip(*map(itemgetter('X', 'y'), data))))
-    return X, y
 
 
 
@@ -53,7 +33,7 @@ def main():
         validate_results = CliUtils.chain_validate(args, schema_mapping=SCHEMA_MAPPING, data_slice_keys=['camera', 'persons'])
         if all(validate_results.values()):
             ### Create train dataset
-            TrainsetCreation.create_datasets(validate_results['persons']['data'], validate_results['camera']['data'], args['haar_path'], args['data_path'])
+            TrainsetCreation.create_datasets(validate_results['persons'], validate_results['camera'], args['haar_path'], args['data_path'])
 
             ### Get model create params info from created dataset
             classes_count = ilen(HDF5Utils.get_hdf5_data(Path(args['data_path'])))
@@ -64,7 +44,7 @@ def main():
             model = Processing.start_learn(
                 generator=HDF5Utils.hdf5_train_data_gen(args['data_path'], n_classes=classes_count, is_infinite=True),
                 model_config_path=args['model_config_path'],
-                camera_frame_shape=validate_results['camera']['data']['camera_frame_shape'],
+                camera_frame_shape=validate_results['camera']['camera_frame_shape'],
                 n_classes=classes_count,
                 epoch=epoch,
                 step_per_epoch=step_per_epoch
@@ -73,14 +53,13 @@ def main():
 
 
     elif args['mode'] == 'predict':
-        persons = _get_persons_flexible(args['data_path'], args['persons'], 'metadata', 'data')
-        validate_args = {'persons': {'data': list(persons.values())}, 'camera': args['camera']}
-        validate_results = CliUtils.chain_validate(validate_args, schema_mapping=SCHEMA_MAPPING, data_slice_keys=['camera', 'persons'])
+        args.update({'persons': CliUtils.get_meta_flexible(args['data_path'] or args['persons'], 'metadata')})
+        validate_results = CliUtils.chain_validate(args, schema_mapping=SCHEMA_MAPPING, data_slice_keys=['camera', 'persons'])
 
         if all(validate_results.values()):
             asyncio.run(Processing.start_predict(
-                persons,
-                validate_results['camera']['data'],
+                validate_results['persons'],
+                validate_results['camera'],
                 args['model_save_path'],
                 args['haar_path']
             ))
