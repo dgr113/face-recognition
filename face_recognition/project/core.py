@@ -19,7 +19,7 @@ from jsonschema import Draft4Validator
 from keras.layers import deserialize
 from keras.models import Model, load_model
 from keras.utils import to_categorical
-from more_itertools import first, always_iterable, spy, collapse, ilen
+from more_itertools import first, always_iterable, spy, collapse
 from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS, UNIVERSAL_SOURCE_TYPE
 from face_recognition.project.type_hints import KEYS_OR_NONE_TYPE, MODEL_CONFIG_TYPE
 from face_recognition.project.type_hints import TRAIN_DATA_GEN_TYPE, TRAIN_DATA_TYPE, TRAIN_LABELS_TYPE
@@ -227,7 +227,7 @@ class HDF5Utils:
 
 
     @staticmethod
-    def _calc_hdf5_batch_count(data_path: UNIVERSAL_PATH_TYPE, field: str, batch_size: int = 200) -> int:
+    def calc_hdf5_batch_count(data_path: UNIVERSAL_PATH_TYPE, field: str, batch_size: int = 200) -> int:
         """ Get data from datasets(fields) or groups saved in HDF5 database
 
             :param data_path: Path to HDF5 data storage
@@ -263,36 +263,36 @@ class HDF5Utils:
 
 
     @staticmethod
-    def get_fit_generator_info(data_path: UNIVERSAL_PATH_TYPE, base_field: str) -> Tuple[int, int]:
-        """ Get Keras <fit_generator> params from HDF5 storage """
-        classes_count = ilen(HDF5Utils.get_hdf5_data(data_path))
-        step_per_epoch = HDF5Utils._calc_hdf5_batch_count(data_path, base_field)
-        return classes_count, step_per_epoch
-
-
-    @staticmethod
     def hdf5_train_data_gen(
-        data_path: Union[str, Path],
+        data_path: UNIVERSAL_PATH_TYPE,
         X_field: str = 'X',
         y_field: str = 'y',
         batch_size: int = 30,
-        n_classes: Union[int, None] = None,
         is_infinite: bool = False
 
     ) -> Tuple[Sequence[np.ndarray], Sequence[np.ndarray]]:
 
-        """ Batches generator of X, y chunks """
+        """ Batches generator of (X, y) chunks from grouped by classes HDF5 storage
+
+            :param is_infinite: Is infinite generator ?
+            :param batch_size: Chunk size
+            :param X_field: Train dataset name
+            :param y_field: Labels dataset name
+            :param data_path: Path to HDF5 storage
+        """
 
         with h5py.File(data_path, 'r') as hdf:
-            batch_shift = batch_size // len(hdf.keys())
+            classes_count = len(hdf.keys())
+            batch_shift = batch_size // classes_count
             start_pos, end_pos = 0, batch_shift
             while True:
                 X, y = [], []
                 for group_key in hdf.keys():
-                    X.extend( hdf[group_key][X_field][start_pos:end_pos] )
-                    y.extend( hdf[group_key][y_field][start_pos:end_pos] )
+                    group_data = hdf[group_key]
+                    X.extend( group_data[X_field][start_pos:end_pos] )
+                    y.extend( group_data[y_field][start_pos:end_pos] )
                 if X and y:
-                    yield np.array(X), to_categorical(y, num_classes=n_classes)
+                    yield np.array(X), to_categorical(y, num_classes=classes_count)
                     start_pos += batch_shift
                     end_pos += batch_shift
                 elif is_infinite:
@@ -429,7 +429,7 @@ class TrainsetCreation:
 
     ) -> None:
 
-        """ Learn model by faces from camera """
+        """ Create classify frames frames from camera """
 
         camera_id = camera['camera_id']
         camera_frame_shape = tuple(camera['camera_frame_shape'])
@@ -446,10 +446,11 @@ class TrainsetCreation:
 
 
 class LearnModel:
+    """ Model compile and fit utils """
 
     @staticmethod
     def prepare_model(d: Mapping, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> MODEL_CONFIG_TYPE:
-        """ Validate and prepare model if needed """
+        """ Prepare model if needed (batch shape and classes count parameters) """
         dd = defaultdict(lambda: defaultdict(dict), **d)  # type: dict
         dd['config']['layers'][0]['config']['batch_input_shape'] = [None, *input_shape]
         dd['config']['layers'][-1]['config']['units'] = n_classes
@@ -549,6 +550,8 @@ class PredictModel:
         model = load_model(model_path)
         predict_func = partial(PredictModel.face_predict, model, persons_mapping)
         cam = cv2.VideoCapture(camera_id)
+        cam.set(3, 800)
+        cam.set(4, 600)
         while True:
             _, frame = cam.read()
             cv2.imshow('frame', frame)

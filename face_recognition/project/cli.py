@@ -5,8 +5,6 @@ import sys
 import asyncio
 from argparse import ArgumentParser
 
-from more_itertools import collapse
-
 sys.path.append( os.path.abspath( os.path.join(os.path.dirname(__file__), '../..') ) )
 from face_recognition.project.core import TrainsetCreation, SystemUtils, CliUtils, PredictModel, HDF5Utils, LearnModel
 from face_recognition.project.schema import SCHEMA_MAPPING
@@ -41,14 +39,15 @@ def main():
     if args['mode'] == 'fit':
         validate_results = CliUtils.chain_validate(args, schema_mapping=SCHEMA_MAPPING, data_slice_keys=['camera', 'persons'])
         if all(validate_results.values()):
-            classes_count, step_per_epoch = HDF5Utils.get_fit_generator_info(args['data_path'], 'y')
-            epoch = 10
+            step_per_epoch = HDF5Utils.calc_hdf5_batch_count(args['data_path'], 'y')
+            epoch = 20
 
+            train_set = tuple(HDF5Utils.hdf5_train_data_gen(args['data_path'], is_infinite=False))
             model = LearnModel.start_learn(
-                HDF5Utils.hdf5_train_data_gen(args['data_path'], n_classes=classes_count, is_infinite=True),
+                train_set,
                 model_config_path=args['model_config_path'],
                 camera_frame_shape=validate_results['camera']['camera_frame_shape'],
-                n_classes=classes_count,
+                n_classes=2,
                 epoch=epoch,
                 step_per_epoch=step_per_epoch
             )
