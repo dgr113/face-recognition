@@ -11,18 +11,19 @@ from pathlib import Path
 from itertools import starmap
 from functools import partial
 from sys import stderr, stdout
-from operator import itemgetter
+from operator import itemgetter, truth
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-from typing import Union, Tuple, Mapping, Sequence, Any, List, Dict, Hashable, Generator
+from typing import Union, Mapping, Any, List, Dict, Hashable, Generator, Sequence, Tuple
 from jsonschema import Draft4Validator
 from keras.layers import deserialize
 from keras.models import Model, load_model
 from keras.utils import to_categorical
-from more_itertools import first, always_iterable, spy
+from more_itertools import first, always_iterable, spy, collapse, ilen
 from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS, UNIVERSAL_SOURCE_TYPE
+from face_recognition.project.type_hints import KEYS_OR_NONE_TYPE, MODEL_CONFIG_TYPE
 from face_recognition.project.type_hints import TRAIN_DATA_GEN_TYPE, TRAIN_DATA_TYPE, TRAIN_LABELS_TYPE
-from face_recognition.project.type_hints import UNIVERSAL_PATH_TYPE, PERSONS_DATA_TYPE, CAMERA_DATA_TYPE, MODEL_CONFIG_TYPE
+from face_recognition.project.type_hints import UNIVERSAL_PATH_TYPE, PERSONS_DATA_TYPE, CAMERA_DATA_TYPE
 from face_recognition.project.type_hints import VALIDATE_RESUTS_TYPE, COORDS_TYPE, FRAME_SHAPE_TYPE
 
 tf.get_logger().setLevel(logging.ERROR)  ### Disable Tensorflow warning and other (non error) messages
@@ -71,9 +72,10 @@ class CliUtils:
 
     @staticmethod
     def get_meta_flexible(source: UNIVERSAL_SOURCE_TYPE, source_field: str = 'metadata') -> Mapping:
-        """ Flexible get Persons Metadata """
+        """ Flexible get metadata dataset from HDF5 storage """
         if isinstance(source, (str, Path)) and str(source).endswith('hdf5'):
-            source = HDF5Utils.get_hdf5_data(source, source_field)
+            metadata = HDF5Utils.get_hdf5_data(source, fields=source_field, json_fields=source_field)
+            source = { k: v.get(source_field, {}) for k, v in metadata.items() }
         return source
 
 
@@ -160,7 +162,7 @@ class CliUtils:
 class ImageWorking:
 
     @staticmethod
-    def draw_rect_area(img: np.array, coords: COORDS_TYPE) -> None:
+    def draw_rect_area(img: np.ndarray, coords: COORDS_TYPE) -> None:
         """ Draw rectangle area
 
             :param img: Image
@@ -170,19 +172,20 @@ class ImageWorking:
 
 
     @staticmethod
-    def resize_frame(img: np.array, *, new_shape: FRAME_SHAPE_TYPE) -> np.array:
+    def resize_frame(img: np.ndarray, *, new_shape: FRAME_SHAPE_TYPE) -> np.ndarray:
         """ Resize image to fixed size """
         return cv2.resize(img, new_shape[:2], interpolation=cv2.INTER_AREA)
 
 
     @staticmethod
     def extract_frame_area(
-        img: np.array,
+        img: np.ndarray,
         coords: Union[COORDS_TYPE, None] = None,
         frame_reshape: Union[FRAME_SHAPE_TYPE, None] = None,
+        *,
         as_grayscale: bool = False
 
-    ) -> np.array:
+    ) -> np.ndarray:
 
         """ Extract frame area with additional options """
 
@@ -197,61 +200,19 @@ class ImageWorking:
 
         if as_grayscale:
             frame_area = cv2.cvtColor(frame_area, cv2.COLOR_BGR2GRAY)
+            frame_area = frame_area[:, :, np.newaxis]  ### Add an additional axis to indicate an empty color channel (for Tensorflow backend)
 
         return frame_area
 
 
     @staticmethod
-    def get_faces_area(f_cascade: cv2.CascadeClassifier, colored_img: np.array, scaleFactor: float = 1.1) -> np.array:
+    def get_faces_area(f_cascade: cv2.CascadeClassifier, colored_img: np.ndarray, scaleFactor: float = 1.1) -> Sequence[COORDS_TYPE]:
         """ Return image with detected face into rectangle """
         frame_area = np.copy(colored_img)
         frame_area = cv2.cvtColor(frame_area, cv2.COLOR_BGR2GRAY)
         faces = f_cascade.detectMultiScale(frame_area, scaleFactor=scaleFactor, minNeighbors=5)
-        results = np.array([ (x, y, (x+w), (y+h)) for (x, y, w, h) in faces ])
+        results = [ (x, y, (x+w), (y+h)) for (x, y, w, h) in faces ]
         return results
-
-
-
-
-class LearnModel:
-
-    @staticmethod
-    def prepare_model(d: Mapping, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> MODEL_CONFIG_TYPE:
-        """ Validate and prepare model if needed """
-        dd = defaultdict(lambda: defaultdict(dict), **d)  # type: dict
-        dd['config']['layers'][0]['batch_input_shape'] = [None, *input_shape]
-        dd['config']['layers'][-1]['units'] = n_classes
-        return dict(dd)
-
-
-    @staticmethod
-    def create_model(config_path: UNIVERSAL_PATH_TYPE, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> Model:
-        """ Compile classify model """
-        with open(config_path,  'r') as f:
-            model_config = LearnModel.prepare_model(json.load(f), input_shape, n_classes)
-            model = deserialize(model_config)
-            model.compile(optimizer='rmsprop', loss='categorical_crossentropy', metrics=['accuracy'])
-            return model
-
-
-    @staticmethod
-    def fit_model_gen(
-        model: Model,
-        generator: TRAIN_DATA_GEN_TYPE,
-        X_test=TRAIN_DATA_TYPE,
-        Y_test=TRAIN_LABELS_TYPE,
-        epochs: int = 1,
-        steps_per_epoch: int = 1,
-        verbose_mode: bool = True
-
-    ) -> Model:
-
-        """ Train and return fitted model """
-        model.fit_generator(generator=generator, epochs=epochs, steps_per_epoch=steps_per_epoch, verbose=verbose_mode)
-        if X_test and Y_test:
-            model.evaluate(X_test, Y_test)
-
-        return model
 
 
 
@@ -260,13 +221,25 @@ class HDF5Utils:
     """ HDF5 data storage utilities """
 
     @staticmethod
-    def json_data_handle(field_name: str, field_data: Any, json_fields: Union[Sequence[Hashable], None] = None) -> Any:
+    def _json_data_handle(field_name: Hashable, field_data: Any, json_fields: KEYS_OR_NONE_TYPE = None) -> Any:
         """ Handle json data from HDF5 datasets """
         return json.loads(field_data) if field_name in (json_fields or []) else field_data
 
 
     @staticmethod
-    def get_hdf5_data(data_path: Union[str, Path], fields: Union[Sequence[Hashable], None] = None, *, json_fields: Union[Sequence[Hashable], None] = None) -> Union[Dict[str, dict], None]:
+    def _calc_hdf5_batch_count(data_path: UNIVERSAL_PATH_TYPE, field: str, batch_size: int = 200) -> int:
+        """ Get data from datasets(fields) or groups saved in HDF5 database
+
+            :param data_path: Path to HDF5 data storage
+            :param field: Field to determine the length
+            :param batch_size: Samples batch size
+        """
+        with h5py.File(data_path, 'r') as hdf:
+            return min(hdf[group_key][field].shape[0] for group_key in hdf.keys()) // (batch_size // len(hdf.keys()))
+
+
+    @staticmethod
+    def get_hdf5_data(data_path: UNIVERSAL_PATH_TYPE, fields: KEYS_OR_NONE_TYPE = None, *, json_fields: KEYS_OR_NONE_TYPE = None) -> Union[Dict[str, dict], None]:
         """ Get data from datasets(fields) or groups saved in HDF5 database
             If <fields> param is not set, only group names are returned
 
@@ -275,9 +248,9 @@ class HDF5Utils:
             :param json_fields: Fields that are JSON-encoded strings
         """
 
-        fields = fields or []
-        json_fields = json_fields or []
-        json_handle_func = partial(HDF5Utils.json_data_handle, json_fields=json_fields)
+        fields = set(always_iterable(fields or []))
+        json_fields = set(always_iterable(json_fields or []))
+        json_handle_func = partial(HDF5Utils._json_data_handle, json_fields=json_fields)
 
         with h5py.File(data_path, 'r') as hdf:
             return {
@@ -290,42 +263,49 @@ class HDF5Utils:
 
 
     @staticmethod
+    def get_fit_generator_info(data_path: UNIVERSAL_PATH_TYPE, base_field: str) -> Tuple[int, int]:
+        """ Get Keras <fit_generator> params from HDF5 storage """
+        classes_count = ilen(HDF5Utils.get_hdf5_data(data_path))
+        step_per_epoch = HDF5Utils._calc_hdf5_batch_count(data_path, base_field)
+        return classes_count, step_per_epoch
+
+
+    @staticmethod
     def hdf5_train_data_gen(
         data_path: Union[str, Path],
         X_field: str = 'X',
         y_field: str = 'y',
-        batch_size: int = 200,
+        batch_size: int = 30,
         n_classes: Union[int, None] = None,
         is_infinite: bool = False
 
-    ) -> Union[Dict[str, dict], None]:
+    ) -> Tuple[Sequence[np.ndarray], Sequence[np.ndarray]]:
 
         """ Batches generator of X, y chunks """
 
         with h5py.File(data_path, 'r') as hdf:
+            batch_shift = batch_size // len(hdf.keys())
+            start_pos, end_pos = 0, batch_shift
             while True:
+                X, y = [], []
                 for group_key in hdf.keys():
-                    start_pos, end_pos = 0, batch_size
-                    while True:
-                        group_data = hdf[group_key]
-                        X = group_data[X_field][start_pos:end_pos]
-                        y = group_data[y_field][start_pos:end_pos]
-                        if X.size and y.size:
-                            yield X, to_categorical(y, num_classes=n_classes)
-                            start_pos = batch_size
-                            end_pos += batch_size
-                        else: break
-
-                if not is_infinite:
-                    break
+                    X.extend( hdf[group_key][X_field][start_pos:end_pos] )
+                    y.extend( hdf[group_key][y_field][start_pos:end_pos] )
+                if X and y:
+                    yield np.array(X), to_categorical(y, num_classes=n_classes)
+                    start_pos += batch_shift
+                    end_pos += batch_shift
+                elif is_infinite:
+                    start_pos, end_pos = 0, batch_shift
+                else: break
 
 
     @staticmethod
     def save_hdf5_train_images(
         chunked_data: CHUNKED_DATA_TYPE,
         metadata: Mapping[str, Any],
-        image_shape: Tuple[int, ...],
-        data_path: Union[str, Path] = './data.hdf5',
+        image_shape: FRAME_SHAPE_TYPE,
+        data_path: UNIVERSAL_PATH_TYPE = './data.hdf5',
         images_ds_name: str = 'X',
         labels_ds_name: str = 'y',
         metadata_ds_name: str = 'metadata'
@@ -333,7 +313,7 @@ class HDF5Utils:
     ) -> None:
 
         """ Chunked and incremental saving data in HDF5 """
-
+        image_shape = tuple(filter(truth, image_shape))
         images, labels = zip(*chunked_data)
 
         with h5py.File(data_path, 'a') as hdf:
@@ -343,8 +323,10 @@ class HDF5Utils:
 
             if person_group_name not in hdf:
                 g = hdf.create_group(person_group_name)
-                X = g.create_dataset(images_ds_name, (0, *image_shape), chunks=(*image_shape, 1), maxshape=(None, *image_shape))
-                y = g.create_dataset(labels_ds_name, (0,), chunks=(1,), maxshape=(None,))
+                # X = g.create_dataset(images_ds_name, (0, *image_shape), chunks=(*image_shape, 1), maxshape=(None, *image_shape))
+                # y = g.create_dataset(labels_ds_name, (0,), chunks=(1,), maxshape=(None,))
+                X = g.create_dataset(images_ds_name, (0, *image_shape), chunks=True, maxshape=(None, *image_shape))
+                y = g.create_dataset(labels_ds_name, (0,), chunks=True, maxshape=(None,))
                 g.create_dataset(metadata_ds_name, data=json.dumps(metadata))
             else:
                 X = hdf[person_group_name][images_ds_name]
@@ -368,7 +350,6 @@ class HDF5Utils:
     ) -> Generator:
 
         """ Wrap <run_in_executor> future into async coroutine """
-
         loop = asyncio.get_running_loop()
         chunked_data = await q.get()
         return loop.run_in_executor(pool, HDF5Utils.save_hdf5_train_images, chunked_data, metadata, image_frame_shape, save_data_path)
@@ -384,12 +365,14 @@ class TrainsetCreation:
         camera_id: int,
         camera_close_key: str,
         haar_face_cascade: cv2.CascadeClassifier,
-        camera_frame_shape: Tuple[int, ...],
+        camera_frame_shape: FRAME_SHAPE_TYPE,
         curr_label: int,
         person: Mapping,
         save_data_path: str,
         max_buffer_len: int = 1E2,
-        max_queue_size: int = 1E3
+        max_queue_size: int = 1E3,
+        *,
+        as_grayscale: bool = False
 
     ) -> None:
 
@@ -407,10 +390,11 @@ class TrainsetCreation:
                     is_live = not (cv2.waitKey(30) == ord(camera_close_key))  ### control of exit button pressing
                     _, frame = cam.read()
                     faces_coords = ImageWorking.get_faces_area(haar_face_cascade, frame)
-                    if faces_coords.any():
+
+                    if faces_coords:
                         first_face_coords = itemgetter(0, 1, 2, 3)(faces_coords[0])  ### Use first face only
                         ImageWorking.draw_rect_area(frame, first_face_coords)
-                        frame_area = ImageWorking.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape)
+                        frame_area = ImageWorking.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape, as_grayscale=as_grayscale)
 
                         ### If image buffer exceeds the limit or exit button is pressed - save the images asynchronously
                         if (shift > max_buffer_len) or not is_live:
@@ -440,7 +424,8 @@ class TrainsetCreation:
         persons: PERSONS_DATA_TYPE,
         camera: CAMERA_DATA_TYPE,
         haar_cascade_path: UNIVERSAL_PATH_TYPE,
-        save_data_path: UNIVERSAL_PATH_TYPE
+        save_data_path: UNIVERSAL_PATH_TYPE,
+        as_grayscale: bool = False
 
     ) -> None:
 
@@ -451,20 +436,88 @@ class TrainsetCreation:
         camera_close_key = camera['camera_close_key']
         haar_face_cascade = cv2.CascadeClassifier(haar_cascade_path)
 
-        for label, person in persons.items():
+        for label, person in sorted(persons.items(), key=itemgetter(0)):
             inp_msg = "{0} {1}, are you ready? [Y/n]: ".format(*map(str.capitalize, always_iterable(itemgetter('first_name', 'last_name')(person))))
             inp_val = input(inp_msg)
             if inp_val.lower() == 'y':
-                asyncio.run(TrainsetCreation._create_stage_dataset(camera_id, camera_close_key, haar_face_cascade, camera_frame_shape, int(label), person, save_data_path))
+                asyncio.run(TrainsetCreation._create_stage_dataset(camera_id, camera_close_key, haar_face_cascade, camera_frame_shape, int(label), person, save_data_path, as_grayscale=as_grayscale))
 
 
 
 
-class Processing:
+class LearnModel:
+
+    @staticmethod
+    def prepare_model(d: Mapping, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> MODEL_CONFIG_TYPE:
+        """ Validate and prepare model if needed """
+        dd = defaultdict(lambda: defaultdict(dict), **d)  # type: dict
+        dd['config']['layers'][0]['config']['batch_input_shape'] = [None, *input_shape]
+        dd['config']['layers'][-1]['config']['units'] = n_classes
+        return dd
+
+
+    @staticmethod
+    def create_model(config_path: UNIVERSAL_PATH_TYPE, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> Model:
+        """ Compile classify model """
+        with open(config_path,  'r') as f:
+            model_config = LearnModel.prepare_model(json.load(f), input_shape, n_classes)
+            model = deserialize(model_config)
+            model.compile(loss='categorical_crossentropy', optimizer='sgd', metrics=['accuracy'])
+            return model
+
+
+    @staticmethod
+    def fit_model(
+        model: Model,
+        train_data: TRAIN_DATA_GEN_TYPE,
+        X_test: TRAIN_DATA_TYPE = None,
+        Y_test: TRAIN_LABELS_TYPE = None,
+        epochs: int = 1,
+        steps_per_epoch: Union[int, None] = None,
+        shuffle: bool = True,
+        verbose_mode: bool = True
+
+    ) -> Model:
+
+        """ Train and return fitted model """
+
+        if isinstance(train_data, Generator):
+            model.fit_generator(generator=train_data, epochs=epochs, steps_per_epoch=steps_per_epoch, shuffle=shuffle, verbose=verbose_mode)
+        else:
+            X, y = ( np.array(tuple(collapse(x, levels=1))) for x in zip(*train_data) )
+            model.fit(X, y, epochs=epochs, shuffle=shuffle, verbose=verbose_mode)
+
+        if X_test and Y_test:
+            model.evaluate(X_test, Y_test)
+
+        return model
+
+
+    @staticmethod
+    def start_learn(
+        train_data: TRAIN_DATA_GEN_TYPE,
+        model_config_path: UNIVERSAL_PATH_TYPE,
+        camera_frame_shape: FRAME_SHAPE_TYPE,
+        n_classes: int,
+        epoch: int = 1,
+        step_per_epoch: Union[int, None] = None,
+        shuffle: bool = True
+
+    ) -> Model:
+
+        """ Fit learn model from training dataset """
+
+        model = LearnModel.create_model(model_config_path, camera_frame_shape, n_classes)
+        return LearnModel.fit_model(model, train_data, epochs=epoch, steps_per_epoch=step_per_epoch, shuffle=shuffle)
+
+
+
+
+class PredictModel:
     """ Model learning and recognition processing """
 
     @staticmethod
-    def face_predict(model, label_mapping: Mapping, frame: np.array, extracted_face: np.array, face_coords: COORDS_TYPE) -> None:
+    def face_predict(model, label_mapping: Mapping, frame: np.ndarray, extracted_face: np.ndarray, face_coords: COORDS_TYPE) -> Sequence[np.ndarray]:
         """ Predict extracted face and draw label with this name """
 
         ### Predict label ###
@@ -481,26 +534,11 @@ class Processing:
             text = cv2.putText(frame, msg, (x, y-i*20), cv2.FONT_HERSHEY_TRIPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
             cv2.imshow('frame', text)
 
-
-    @staticmethod
-    def start_learn(
-        generator,
-        model_config_path: UNIVERSAL_PATH_TYPE,
-        camera_frame_shape: FRAME_SHAPE_TYPE,
-        n_classes: int,
-        epoch: int = 1,
-        step_per_epoch: int = 1
-
-    ) -> Model:
-
-        """ Fit learn model from training dataset """
-
-        model = LearnModel.create_model(model_config_path, camera_frame_shape, n_classes)
-        return LearnModel.fit_model_gen(model=model, generator=generator, epochs=epoch, steps_per_epoch=step_per_epoch)
+        return predicted_code
 
 
     @staticmethod
-    async def start_predict(persons_mapping: Mapping, camera: Mapping, model_path: str, haar_cascade_path: str) -> None:
+    async def start_predict(persons_mapping: Mapping, camera: Mapping, model_path: str, haar_cascade_path: str, *, as_grayscale: bool = False) -> None:
         """ Recognition faces from camera """
 
         camera_id = camera['camera_id']
@@ -509,17 +547,16 @@ class Processing:
 
         haar_face_cascade = cv2.CascadeClassifier(haar_cascade_path)
         model = load_model(model_path)
-        predict_func = partial(Processing.face_predict, model, persons_mapping)
-
+        predict_func = partial(PredictModel.face_predict, model, persons_mapping)
         cam = cv2.VideoCapture(camera_id)
         while True:
             _, frame = cam.read()
             cv2.imshow('frame', frame)
 
             faces_coords = ImageWorking.get_faces_area(haar_face_cascade, frame)
-            if faces_coords.any():
+            if faces_coords:
                 first_face_coords = itemgetter(0, 1, 2, 3)(faces_coords[0])  ### Use first face only
-                extracted_face = ImageWorking.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape)
+                extracted_face = ImageWorking.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape, as_grayscale=as_grayscale)
                 predict_func(frame, extracted_face, first_face_coords)
 
             if cv2.waitKey(30) == ord(camera_close_key):
