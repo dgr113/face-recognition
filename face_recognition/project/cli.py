@@ -42,14 +42,15 @@ def main():
             step_per_epoch = HDF5Utils.calc_hdf5_batch_count(args['data_path'], 'y')
             epoch = 20
 
-            train_set = tuple(HDF5Utils.hdf5_train_data_gen(args['data_path'], is_infinite=False))
+            # train_set = tuple(HDF5Utils.hdf5_train_data_gen(args['data_path'], is_infinite=False))
+            train_set = HDF5Utils.ProductSequence(args['data_path'])
             model = LearnModel.start_learn(
                 train_set,
                 model_config_path=args['model_config_path'],
                 camera_frame_shape=validate_results['camera']['camera_frame_shape'],
                 n_classes=2,
                 epoch=epoch,
-                step_per_epoch=step_per_epoch
+                # step_per_epoch=step_per_epoch
             )
             model.save(args['model_save_path'])
 

@@ -1,6 +1,7 @@
 # coding: utf-8
 
 import numpy as np
+import keras.utils
 from pathlib import Path
 from typing import Tuple, Sequence, Union, Hashable, Iterable, Mapping, Any
 
@@ -25,4 +26,4 @@ FRAME_SHAPE_TYPE = Tuple[int, int, int]
 MODEL_CONFIG_TYPE = Mapping[str, Union[str, int, list, None]]
 TRAIN_DATA_TYPE = Sequence[np.ndarray]
 TRAIN_LABELS_TYPE = Sequence[np.ndarray]
-TRAIN_DATA_GEN_TYPE = Tuple[TRAIN_DATA_TYPE, TRAIN_LABELS_TYPE]
+TRAIN_DATA_GEN_TYPE = Union[Tuple[TRAIN_DATA_TYPE, TRAIN_LABELS_TYPE], keras.utils.Sequence]

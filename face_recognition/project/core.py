@@ -11,14 +11,14 @@ from pathlib import Path
 from itertools import starmap
 from functools import partial
 from sys import stderr, stdout
-from operator import itemgetter, truth
+from operator import itemgetter, truth, mul
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from typing import Union, Mapping, Any, List, Dict, Hashable, Generator, Sequence, Tuple
 from jsonschema import Draft4Validator
 from keras.layers import deserialize
 from keras.models import Model, load_model
-from keras.utils import to_categorical
+from keras.utils import Sequence as KerasSequence, to_categorical
 from more_itertools import first, always_iterable, spy, collapse
 from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS, UNIVERSAL_SOURCE_TYPE
 from face_recognition.project.type_hints import KEYS_OR_NONE_TYPE, MODEL_CONFIG_TYPE
@@ -220,6 +220,39 @@ class ImageWorking:
 class HDF5Utils:
     """ HDF5 data storage utilities """
 
+    class ProductSequence(KerasSequence):
+        """ Produce train batch """
+        def __init__(self, data_path: UNIVERSAL_PATH_TYPE, X_field: str = 'X', y_field: str = 'y', batch_size: int = 30):
+            with h5py.File(data_path, 'r') as hdf:
+                self.data_path = data_path
+                self.X_field = X_field
+                self.y_field = y_field
+
+                self.classes_count = len(hdf.keys())
+                self.batch_shift = batch_size // self.classes_count
+                self.step_per_epoch = min(hdf[group_key][y_field].shape[0] for group_key in hdf.keys()) // self.batch_shift
+
+        @staticmethod
+        def iter_func(hdf, X_field: str, y_field: str, start_pos: int, end_pos: int, group_key: str) -> Tuple[np.ndarray, np.ndarray]:
+            group_data = hdf[group_key]
+            return group_data[X_field][start_pos:end_pos], group_data[y_field][start_pos:end_pos]
+
+        def __len__(self) -> int:
+            """ Returns number of step(chunks) in epoch """
+            return self.step_per_epoch
+
+        def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+            """ Returns a training data chunk """
+            with h5py.File(self.data_path, 'r') as hdf:
+                # noinspection PyTypeChecker
+                start_pos, end_pos = map(partial(mul, self.batch_shift), [idx, idx+1])
+                X, y = zip(map(
+                    partial(self.iter_func, hdf, self.X_field, self.y_field, start_pos, end_pos),
+                    hdf.keys()
+                ))
+                return np.array(X), to_categorical(y, self.classes_count)
+
+
     @staticmethod
     def _json_data_handle(field_name: Hashable, field_data: Any, json_fields: KEYS_OR_NONE_TYPE = None) -> Any:
         """ Handle json data from HDF5 datasets """
@@ -260,44 +293,6 @@ class HDF5Utils:
                 }
                 for group_key in hdf.keys()
             }
-
-
-    @staticmethod
-    def hdf5_train_data_gen(
-        data_path: UNIVERSAL_PATH_TYPE,
-        X_field: str = 'X',
-        y_field: str = 'y',
-        batch_size: int = 30,
-        is_infinite: bool = False
-
-    ) -> Tuple[Sequence[np.ndarray], Sequence[np.ndarray]]:
-
-        """ Batches generator of (X, y) chunks from grouped by classes HDF5 storage
-
-            :param is_infinite: Is infinite generator ?
-            :param batch_size: Chunk size
-            :param X_field: Train dataset name
-            :param y_field: Labels dataset name
-            :param data_path: Path to HDF5 storage
-        """
-
-        with h5py.File(data_path, 'r') as hdf:
-            classes_count = len(hdf.keys())
-            batch_shift = batch_size // classes_count
-            start_pos, end_pos = 0, batch_shift
-            while True:
-                X, y = [], []
-                for group_key in hdf.keys():
-                    group_data = hdf[group_key]
-                    X.extend( group_data[X_field][start_pos:end_pos] )
-                    y.extend( group_data[y_field][start_pos:end_pos] )
-                if X and y:
-                    yield np.array(X), to_categorical(y, num_classes=classes_count)
-                    start_pos += batch_shift
-                    end_pos += batch_shift
-                elif is_infinite:
-                    start_pos, end_pos = 0, batch_shift
-                else: break
 
 
     @staticmethod
@@ -482,7 +477,7 @@ class LearnModel:
 
         """ Train and return fitted model """
 
-        if isinstance(train_data, Generator):
+        if isinstance(train_data, (Generator, KerasSequence)):
             model.fit_generator(generator=train_data, epochs=epochs, steps_per_epoch=steps_per_epoch, shuffle=shuffle, verbose=verbose_mode)
         else:
             X, y = ( np.array(tuple(collapse(x, levels=1))) for x in zip(*train_data) )
