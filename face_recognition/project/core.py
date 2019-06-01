@@ -22,8 +22,7 @@ from keras.layers import deserialize
 from keras.models import Model, load_model
 from keras.utils import Sequence as KerasSequence, to_categorical
 from more_itertools import first, always_iterable, spy, collapse
-from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS_TYPE, UNIVERSAL_SOURCE_TYPE, \
-    POINT_COORDS_TYPE
+from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS_TYPE, UNIVERSAL_SOURCE_TYPE, POINT_COORDS_TYPE
 from face_recognition.project.type_hints import KEYS_OR_NONE_TYPE, MODEL_CONFIG_TYPE, COLOR_TYPE, JSON_DATA_TYPES
 from face_recognition.project.type_hints import TRAIN_DATA_GEN_TYPE, TRAIN_DATA_TYPE, TRAIN_LABELS_TYPE
 from face_recognition.project.type_hints import UNIVERSAL_PATH_TYPE, UNIVERSAL_CONFIG_TYPE, HDF5_DATA_TYPE, HDF5_GROUPED_DATA_TYPE
