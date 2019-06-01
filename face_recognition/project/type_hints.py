@@ -15,6 +15,7 @@ VALIDATE_RESUTS_TYPE = Tuple[str, Union[Mapping, None]]
 COORDS_TYPE = Tuple[int, int, int, int]
 COLOR_TYPE = Tuple[int, int, int]
 KEYS_OR_NONE_TYPE = Union[Sequence[Hashable], None]
+POINT_COORDS_TYPE = Tuple[int, int]
 
 
 ### USER INPUT DATA TYPES

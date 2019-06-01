@@ -1,4 +1,5 @@
 # coding: utf-8
+# python3.7
 
 import cv2
 import json
@@ -21,7 +22,8 @@ from keras.layers import deserialize
 from keras.models import Model, load_model
 from keras.utils import Sequence as KerasSequence, to_categorical
 from more_itertools import first, always_iterable, spy, collapse
-from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS_TYPE, UNIVERSAL_SOURCE_TYPE
+from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS_TYPE, UNIVERSAL_SOURCE_TYPE, \
+    POINT_COORDS_TYPE
 from face_recognition.project.type_hints import KEYS_OR_NONE_TYPE, MODEL_CONFIG_TYPE, COLOR_TYPE, JSON_DATA_TYPES
 from face_recognition.project.type_hints import TRAIN_DATA_GEN_TYPE, TRAIN_DATA_TYPE, TRAIN_LABELS_TYPE
 from face_recognition.project.type_hints import UNIVERSAL_PATH_TYPE, UNIVERSAL_CONFIG_TYPE, HDF5_DATA_TYPE, HDF5_GROUPED_DATA_TYPE
@@ -32,18 +34,16 @@ tf.get_logger().setLevel(logging.ERROR)  ### Disable Tensorflow warning and othe
 
 
 
-@dataclass
+@dataclass(frozen=True)
 class RectArea:
     """ Rectangle area description """
 
-    __slots__ = 'x1', 'y1', 'x2', 'y2'
+    x1: int  # Left up <X> coordinate
+    y1: int  # Left up <Y> coordinate
+    x2: int  # Right down <X> coordinate
+    y2: int  # Right down <Y> coordinate
 
-    x1: int  # UP left_x
-    y1: int  # up_left_y
-    x2: int  # down_right_x
-    y2: int  # down_right_y
-
-    def to_points(self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    def to_points(self) -> Tuple[POINT_COORDS_TYPE, POINT_COORDS_TYPE]:
         return (self.x1, self.y1), (self.x2, self.y2)
 
 
@@ -490,9 +490,7 @@ class TrainsetCreation:
             :param as_grayscale: Extract person faces as grayscale
         """
 
-        camera_id = camera['camera_id']
-        camera_frame_shape = tuple(camera['camera_frame_shape'])
-        camera_close_key = camera['camera_close_key']
+        camera_id, camera_frame_shape, camera_close_key = itemgetter('camera_id', 'camera_frame_shape', 'camera_close_key')(camera)
         haar_face_cascade = cv2.CascadeClassifier(haar_cascade_path)
 
         for label, person in sorted(persons.items(), key=itemgetter(0)):
@@ -596,6 +594,7 @@ class LearnModel:
 
         frame_shape = itemgetter('camera_frame_shape')(camera_config)
         epochs, steps_per_epoch, shuffle = itemgetter('epochs', 'steps_per_epoch', 'shuffle')(learn_config)
+
         model = LearnModel._create_model(model_config_path, frame_shape, n_classes)
         return LearnModel.fit_model(model, train_data, epochs=epochs, steps_per_epoch=steps_per_epoch, shuffle=shuffle, verbose_mode=verbose_mode)
 
