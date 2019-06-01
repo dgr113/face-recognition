@@ -11,22 +11,77 @@ from pathlib import Path
 from itertools import starmap
 from functools import partial
 from sys import stderr, stdout
-from operator import itemgetter, truth, mul
+from operator import itemgetter, truth
 from collections import defaultdict, deque
+from dataclasses import dataclass, astuple, InitVar
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-from typing import Union, Mapping, Any, List, Dict, Hashable, Generator, Sequence, Tuple
+from typing import Union, Mapping, Generator, Sequence, Tuple
 from jsonschema import Draft4Validator
 from keras.layers import deserialize
 from keras.models import Model, load_model
 from keras.utils import Sequence as KerasSequence, to_categorical
 from more_itertools import first, always_iterable, spy, collapse
-from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS, UNIVERSAL_SOURCE_TYPE
-from face_recognition.project.type_hints import KEYS_OR_NONE_TYPE, MODEL_CONFIG_TYPE
+from face_recognition.project.type_hints import CHUNKED_DATA_TYPE, ONE_MORE_KEYS_TYPE, UNIVERSAL_SOURCE_TYPE
+from face_recognition.project.type_hints import KEYS_OR_NONE_TYPE, MODEL_CONFIG_TYPE, COLOR_TYPE, JSON_DATA_TYPES
 from face_recognition.project.type_hints import TRAIN_DATA_GEN_TYPE, TRAIN_DATA_TYPE, TRAIN_LABELS_TYPE
-from face_recognition.project.type_hints import UNIVERSAL_PATH_TYPE, PERSONS_DATA_TYPE, CAMERA_DATA_TYPE
+from face_recognition.project.type_hints import UNIVERSAL_PATH_TYPE, UNIVERSAL_CONFIG_TYPE, HDF5_DATA_TYPE, HDF5_GROUPED_DATA_TYPE
 from face_recognition.project.type_hints import VALIDATE_RESUTS_TYPE, COORDS_TYPE, FRAME_SHAPE_TYPE
 
 tf.get_logger().setLevel(logging.ERROR)  ### Disable Tensorflow warning and other (non error) messages
+
+
+
+
+@dataclass
+class RectArea:
+    """ Rectangle area description """
+
+    __slots__ = 'x1', 'y1', 'x2', 'y2'
+
+    x1: int  # UP left_x
+    y1: int  # up_left_y
+    x2: int  # down_right_x
+    y2: int  # down_right_y
+
+    def to_points(self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        return (self.x1, self.y1), (self.x2, self.y2)
+
+
+
+
+@dataclass
+class ProductSequence(KerasSequence):
+    """ Keras model fit train batch generator """
+
+    data_path: UNIVERSAL_PATH_TYPE  # Path to HDF5 storage
+    X_field: str = 'X'  # Name of dataset with train data
+    y_field: str = 'y'  # Name of dataset with train labels
+    batch_size: InitVar[int] = 30  # Data chunk size on the one Keras model fit iteration
+
+    def __post_init__(self, batch_size: int):
+        with h5py.File(self.data_path, 'r') as hdf:
+            self.classes_count = len(hdf.keys())
+            self.batch_shift = batch_size // self.classes_count
+            self.step_per_epoch = min(hdf[group_key][self.y_field].shape[0] for group_key in hdf.keys()) // self.batch_shift
+
+
+    def __len__(self) -> int:
+        """ Returns number of step(chunks) in epoch """
+        return self.step_per_epoch
+
+
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """ Returns a training data chunk """
+
+        with h5py.File(self.data_path, 'r') as hdf:
+            start_pos, end_pos = self.batch_shift * idx, self.batch_shift * (idx + 1)
+            X, y = [], []
+            for group in hdf.keys():
+                group_data = hdf[group]
+                X.extend( group_data[self.X_field][start_pos:end_pos] )
+                y.extend( group_data[self.y_field][start_pos:end_pos] )
+
+            return np.array(X), to_categorical(y, self.classes_count)
 
 
 
@@ -35,12 +90,12 @@ class SystemUtils:
     """ System utility """
 
     @staticmethod
-    def print_err(msg: Any, is_not_suppress: bool = True, ch: str = 'stderr', *args, **kwargs) -> None:
-        """ Print Error into stderror/stdout
+    def print_err(msg: str, is_not_suppress: bool = True, ch: str = 'stderr', *args, **kwargs) -> None:
+        """ Print Error into selected channel
 
             :param msg: Message to output
             :param ch: Channel to output (stdout or stderr)
-            :param is_not_suppress: Not suppress output
+            :param is_not_suppress: Output is not suppressed
         """
         if is_not_suppress:
             ch = stdout if ch == 'stdout' else stderr
@@ -53,22 +108,19 @@ class DataUtils:
     """ Utilities for general working with data in different formats and structures """
 
     @staticmethod
-    def dict_slice(d: Mapping, sliced_keys: ONE_MORE_KEYS) -> Mapping:
-        """ Slice dict by keys """
-        sliced_keys = tuple(always_iterable(sliced_keys))
-        return { k: d[k] for k in d if k in sliced_keys }
+    def dict_slice(d: Mapping, sliced_keys: ONE_MORE_KEYS_TYPE) -> dict:
+        """ Slice dict by keys
 
-
-    @staticmethod
-    def get_enumerate_mapping(d: Mapping[str, List[dict]], field_key: Hashable = 'data') -> Mapping[int, dict]:
-        """ Get enumerate mapping (like Labels-Mapping) for Json struct """
-        return { str(k): v for k, v in enumerate(CliUtils.mapping_flex_loader(d, {}).get(field_key, [])) }
+            :param d: Mapping for slicing dy selective keys
+            :param sliced_keys: Keys for slicing
+        """
+        return { k: d[k] for k in d if k in tuple(always_iterable(sliced_keys)) }
 
 
 
 
 class CliUtils:
-    """ Command line and validate tools """
+    """ Command line and validate utils """
 
     @staticmethod
     def get_meta_flexible(source: UNIVERSAL_SOURCE_TYPE, source_field: str = 'metadata') -> Mapping:
@@ -80,7 +132,7 @@ class CliUtils:
 
 
     @staticmethod
-    def mapping_flex_loader(source: UNIVERSAL_SOURCE_TYPE, default: Any = None, is_error_suppress: bool = False) -> Union[Mapping, Any]:
+    def mapping_flex_loader(source: UNIVERSAL_SOURCE_TYPE, default: JSON_DATA_TYPES = None, is_error_suppress: bool = False) -> UNIVERSAL_CONFIG_TYPE:
         """ Flexible get mapping from json file or Python Mapping
 
             :param source: Source file or Python Mapping object
@@ -114,7 +166,7 @@ class CliUtils:
 
 
     @staticmethod
-    def validate_json(schema_name: str, json_path: Union[Path, str], *, schema_mapping: Mapping) -> VALIDATE_RESUTS_TYPE:
+    def validate_json(schema_name: str, json_path: UNIVERSAL_PATH_TYPE, *, schema_mapping: UNIVERSAL_CONFIG_TYPE) -> VALIDATE_RESUTS_TYPE:
         """ Validate json file by schema
 
             :param schema_name: Schema name for access for JSON schema Mapping from <schema_mapping>
@@ -130,7 +182,7 @@ class CliUtils:
             try:
                 validator = Draft4Validator(schema)
                 validator.validate(data)
-            except Exception as err: SystemUtils.print_err(err)
+            except Exception as err: SystemUtils.print_err(str(err))
             else: result = schema_name, data
 
         return result
@@ -138,20 +190,25 @@ class CliUtils:
 
     @staticmethod
     def chain_validate(
-        validate_data: Mapping[str, Any],
-        schema_mapping: Mapping[str, str],
-        data_slice_keys: Union[ONE_MORE_KEYS, None] = None
+        data: UNIVERSAL_CONFIG_TYPE,
+        schema_mapping: UNIVERSAL_CONFIG_TYPE,
+        data_slice_keys: Union[ONE_MORE_KEYS_TYPE, None] = None
 
-    ) -> Mapping[str, Any]:
+    ) -> Mapping[str, UNIVERSAL_CONFIG_TYPE]:
 
-        """ Chain validate json files with their schemas """
+        """ Chain validate json files by schemas description
+
+            :param data: User input data for validation
+            :param schema_mapping: Json-schemes description mapping
+            :param data_slice_keys: Selective validation
+        """
 
         if data_slice_keys:
-            validate_data = DataUtils.dict_slice(validate_data, data_slice_keys)
+            data = DataUtils.dict_slice(data, data_slice_keys)
 
         validate_results = dict(starmap(
             partial(CliUtils.validate_json, schema_mapping=schema_mapping),
-            validate_data.items()
+            data.items()
         ))
 
         return validate_results
@@ -160,41 +217,52 @@ class CliUtils:
 
 
 class ImageWorking:
+    """ Utilities for working with images as a Numpy arrays """
 
     @staticmethod
-    def draw_rect_area(img: np.ndarray, coords: COORDS_TYPE) -> None:
+    def _resize_frame(img: np.ndarray, *, new_shape: FRAME_SHAPE_TYPE, interpolation_code: int = cv2.INTER_AREA) -> np.ndarray:
+        """ Resize image to fixed size
+
+            :param img: Image as a numpy array
+            :param new_shape: Shape for resizing image
+        """
+        return cv2.resize(img, new_shape[:2], interpolation=interpolation_code)
+
+
+    @staticmethod
+    def draw_rect_area(img: np.ndarray, coords: RectArea, color: COLOR_TYPE = (0, 255, 0)) -> None:
         """ Draw rectangle area
 
-            :param img: Image
+            :param img: Image as a numpy array
             :param coords: Rectangle coords [up_left_x, up_left_y, down_right_x, down_right_y]
+            :param color: Color RGB code
         """
-        cv2.rectangle(img, (coords[0], coords[1]), (coords[2], coords[3]), (0, 255, 0), 2)
-
-
-    @staticmethod
-    def resize_frame(img: np.ndarray, *, new_shape: FRAME_SHAPE_TYPE) -> np.ndarray:
-        """ Resize image to fixed size """
-        return cv2.resize(img, new_shape[:2], interpolation=cv2.INTER_AREA)
+        cv2.rectangle(img, *coords.to_points(), color, 2)
 
 
     @staticmethod
     def extract_frame_area(
         img: np.ndarray,
-        coords: Union[COORDS_TYPE, None] = None,
+        coords: Union[RectArea, None] = None,
         frame_reshape: Union[FRAME_SHAPE_TYPE, None] = None,
-        *,
-        as_grayscale: bool = False
+        *, as_grayscale: bool = False
 
     ) -> np.ndarray:
 
-        """ Extract frame area with additional options """
+        """ Extract frame area with additional options
+
+            :param img: Image as a numpy array
+            :param coords: Rectangle coords [up_left_x, up_left_y, down_right_x, down_right_y]
+            :param frame_reshape: Shape for resizing image
+            :param as_grayscale: Extract frame as grayscale
+        """
 
         frame_area = np.copy(img)
 
         if coords:
-            x1, y1, x2, y2 = coords
+            x1, y1, x2, y2 = astuple(coords)
             if y2 <= frame_area.shape[0] and x2 <= frame_area.shape[1]:
-                frame_area = ImageWorking.resize_frame(img[y1:y2, x1:x2], new_shape=frame_reshape[:2]) if frame_reshape else img[y1:y2, x1:x2]
+                frame_area = ImageWorking._resize_frame(img[y1:y2, x1:x2], new_shape=frame_reshape[:2]) if frame_reshape else img[y1:y2, x1:x2]
             else:
                 SystemUtils.print_err('Error! Wrong area range to extract from image frame. Return original image...')
 
@@ -206,9 +274,14 @@ class ImageWorking:
 
 
     @staticmethod
-    def get_faces_area(f_cascade: cv2.CascadeClassifier, colored_img: np.ndarray, scaleFactor: float = 1.1) -> Sequence[COORDS_TYPE]:
-        """ Return image with detected face into rectangle """
-        frame_area = np.copy(colored_img)
+    def get_faces_area(f_cascade: cv2.CascadeClassifier, img: np.ndarray, scaleFactor: float = 1.1) -> Sequence[COORDS_TYPE]:
+        """ Return extracted face coordinates
+
+            :param f_cascade: Cascade classifier for extract face from image frame
+            :param img: Image frame
+            :param scaleFactor: Scale factor for extract faces
+        """
+        frame_area = np.copy(img)
         frame_area = cv2.cvtColor(frame_area, cv2.COLOR_BGR2GRAY)
         faces = f_cascade.detectMultiScale(frame_area, scaleFactor=scaleFactor, minNeighbors=5)
         results = [ (x, y, (x+w), (y+h)) for (x, y, w, h) in faces ]
@@ -220,59 +293,25 @@ class ImageWorking:
 class HDF5Utils:
     """ HDF5 data storage utilities """
 
-    class ProductSequence(KerasSequence):
-        """ Produce train batch """
-        def __init__(self, data_path: UNIVERSAL_PATH_TYPE, X_field: str = 'X', y_field: str = 'y', batch_size: int = 30):
-            with h5py.File(data_path, 'r') as hdf:
-                self.data_path = data_path
-                self.X_field = X_field
-                self.y_field = y_field
-
-                self.classes_count = len(hdf.keys())
-                self.batch_shift = batch_size // self.classes_count
-                self.step_per_epoch = min(hdf[group_key][y_field].shape[0] for group_key in hdf.keys()) // self.batch_shift
-
-        @staticmethod
-        def iter_func(hdf, X_field: str, y_field: str, start_pos: int, end_pos: int, group_key: str) -> Tuple[np.ndarray, np.ndarray]:
-            group_data = hdf[group_key]
-            return group_data[X_field][start_pos:end_pos], group_data[y_field][start_pos:end_pos]
-
-        def __len__(self) -> int:
-            """ Returns number of step(chunks) in epoch """
-            return self.step_per_epoch
-
-        def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
-            """ Returns a training data chunk """
-            with h5py.File(self.data_path, 'r') as hdf:
-                # noinspection PyTypeChecker
-                start_pos, end_pos = map(partial(mul, self.batch_shift), [idx, idx+1])
-                X, y = zip(map(
-                    partial(self.iter_func, hdf, self.X_field, self.y_field, start_pos, end_pos),
-                    hdf.keys()
-                ))
-                return np.array(X), to_categorical(y, self.classes_count)
-
-
     @staticmethod
-    def _json_data_handle(field_name: Hashable, field_data: Any, json_fields: KEYS_OR_NONE_TYPE = None) -> Any:
-        """ Handle json data from HDF5 datasets """
+    def _json_data_handle(field_name: str, field_data: HDF5_DATA_TYPE, json_fields: Union[str, None] = None) -> HDF5_DATA_TYPE:
+        """ Handle json data from HDF5 datasets
+
+            :param field_name: Field (dataset) name
+            :param field_data: Field (dataset) data
+            :param json_fields: Field (dataset) names are interpreted as Json
+        """
         return json.loads(field_data) if field_name in (json_fields or []) else field_data
 
 
     @staticmethod
-    def calc_hdf5_batch_count(data_path: UNIVERSAL_PATH_TYPE, field: str, batch_size: int = 200) -> int:
-        """ Get data from datasets(fields) or groups saved in HDF5 database
+    def get_hdf5_data(
+        data_path: UNIVERSAL_PATH_TYPE,
+        fields: KEYS_OR_NONE_TYPE = None,
+        *, json_fields: KEYS_OR_NONE_TYPE = None
 
-            :param data_path: Path to HDF5 data storage
-            :param field: Field to determine the length
-            :param batch_size: Samples batch size
-        """
-        with h5py.File(data_path, 'r') as hdf:
-            return min(hdf[group_key][field].shape[0] for group_key in hdf.keys()) // (batch_size // len(hdf.keys()))
+    ) -> Union[HDF5_GROUPED_DATA_TYPE, None]:
 
-
-    @staticmethod
-    def get_hdf5_data(data_path: UNIVERSAL_PATH_TYPE, fields: KEYS_OR_NONE_TYPE = None, *, json_fields: KEYS_OR_NONE_TYPE = None) -> Union[Dict[str, dict], None]:
         """ Get data from datasets(fields) or groups saved in HDF5 database
             If <fields> param is not set, only group names are returned
 
@@ -287,10 +326,7 @@ class HDF5Utils:
 
         with h5py.File(data_path, 'r') as hdf:
             return {
-                group_key: {
-                    field: json_handle_func(field, hdf["{0}/{1}".format(group_key, field)][()])
-                    for field in fields
-                }
+                group_key: { field: json_handle_func(field, hdf[group_key][field][()]) for field in fields }
                 for group_key in hdf.keys()
             }
 
@@ -298,7 +334,7 @@ class HDF5Utils:
     @staticmethod
     def save_hdf5_train_images(
         chunked_data: CHUNKED_DATA_TYPE,
-        metadata: Mapping[str, Any],
+        metadata: UNIVERSAL_CONFIG_TYPE,
         image_shape: FRAME_SHAPE_TYPE,
         data_path: UNIVERSAL_PATH_TYPE = './data.hdf5',
         images_ds_name: str = 'X',
@@ -307,7 +343,17 @@ class HDF5Utils:
 
     ) -> None:
 
-        """ Chunked and incremental saving data in HDF5 """
+        """ Chunked and incremental saving data in HDF5
+
+            :param chunked_data:
+            :param metadata:
+            :param image_shape:
+            :param data_path:
+            :param images_ds_name:
+            :param labels_ds_name:
+            :param metadata_ds_name:
+        """
+
         image_shape = tuple(filter(truth, image_shape))
         images, labels = zip(*chunked_data)
 
@@ -318,8 +364,6 @@ class HDF5Utils:
 
             if person_group_name not in hdf:
                 g = hdf.create_group(person_group_name)
-                # X = g.create_dataset(images_ds_name, (0, *image_shape), chunks=(*image_shape, 1), maxshape=(None, *image_shape))
-                # y = g.create_dataset(labels_ds_name, (0,), chunks=(1,), maxshape=(None,))
                 X = g.create_dataset(images_ds_name, (0, *image_shape), chunks=True, maxshape=(None, *image_shape))
                 y = g.create_dataset(labels_ds_name, (0,), chunks=True, maxshape=(None,))
                 g.create_dataset(metadata_ds_name, data=json.dumps(metadata))
@@ -336,15 +380,16 @@ class HDF5Utils:
 
     @staticmethod
     async def save_hdf5_train_images_async(
-        save_data_path: Union[str, Path],
+        save_data_path: UNIVERSAL_PATH_TYPE,
         q: asyncio.Queue,
-        image_frame_shape,
-        metadata: Mapping,
+        image_frame_shape: FRAME_SHAPE_TYPE,
+        metadata: UNIVERSAL_CONFIG_TYPE,
         pool: Union[ThreadPoolExecutor, ProcessPoolExecutor] = None
 
     ) -> Generator:
 
         """ Wrap <run_in_executor> future into async coroutine """
+
         loop = asyncio.get_running_loop()
         chunked_data = await q.get()
         return loop.run_in_executor(pool, HDF5Utils.save_hdf5_train_images, chunked_data, metadata, image_frame_shape, save_data_path)
@@ -362,7 +407,7 @@ class TrainsetCreation:
         haar_face_cascade: cv2.CascadeClassifier,
         camera_frame_shape: FRAME_SHAPE_TYPE,
         curr_label: int,
-        person: Mapping,
+        person: UNIVERSAL_CONFIG_TYPE,
         save_data_path: str,
         max_buffer_len: int = 1E2,
         max_queue_size: int = 1E3,
@@ -371,7 +416,18 @@ class TrainsetCreation:
 
     ) -> None:
 
-        """ One Person processing """
+        """ (NEED TO VERIFY!) Processing of each frame - search for faces and save them into HDF5 storage with class label and meta-information
+
+            :param camera_id: Camera system id
+            :param camera_close_key: Keyboard button key for exit current camera session
+            :param haar_face_cascade: Haar cascade model object
+            :param camera_frame_shape: Camera frame shape (width, height and color channel)
+            :param curr_label: Current class label to identify a person's face
+            :param person: Person`s meta-information
+            :param save_data_path: Path to HDF5 storage
+            :param max_buffer_len: Maximum number of extracted faces in the RAM buffer before storing in storage
+            :param max_queue_size: Maximum size of async saving task Queue (NEED TO VERIFY!)
+        """
 
         cam = cv2.VideoCapture(camera_id)
 
@@ -388,6 +444,7 @@ class TrainsetCreation:
 
                     if faces_coords:
                         first_face_coords = itemgetter(0, 1, 2, 3)(faces_coords[0])  ### Use first face only
+                        first_face_coords = RectArea(*first_face_coords)
                         ImageWorking.draw_rect_area(frame, first_face_coords)
                         frame_area = ImageWorking.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape, as_grayscale=as_grayscale)
 
@@ -416,15 +473,22 @@ class TrainsetCreation:
 
     @staticmethod
     def create_datasets(
-        persons: PERSONS_DATA_TYPE,
-        camera: CAMERA_DATA_TYPE,
+        persons: UNIVERSAL_CONFIG_TYPE,
+        camera: UNIVERSAL_CONFIG_TYPE,
         haar_cascade_path: UNIVERSAL_PATH_TYPE,
         save_data_path: UNIVERSAL_PATH_TYPE,
         as_grayscale: bool = False
 
     ) -> None:
 
-        """ Create classify frames frames from camera """
+        """ Create classify frames frames from camera
+
+            :param persons: Mapping of persons labels and meta-information
+            :param camera: Camera config
+            :param haar_cascade_path: Path to Haar-cascade configuration file
+            :param save_data_path: HDF5 storage to save extracted faces and meta-information
+            :param as_grayscale: Extract person faces as grayscale
+        """
 
         camera_id = camera['camera_id']
         camera_frame_shape = tuple(camera['camera_frame_shape'])
@@ -444,8 +508,13 @@ class LearnModel:
     """ Model compile and fit utils """
 
     @staticmethod
-    def prepare_model(d: Mapping, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> MODEL_CONFIG_TYPE:
-        """ Prepare model if needed (batch shape and classes count parameters) """
+    def __prepare_model(d: Mapping, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> MODEL_CONFIG_TYPE:
+        """ Prepare model if needed (batch shape and classes count parameters)
+
+            :param d: Model config from json
+            :param input_shape: Input train data shape for implementation into model
+            :param n_classes: Classes count for implementation into model
+        """
         dd = defaultdict(lambda: defaultdict(dict), **d)  # type: dict
         dd['config']['layers'][0]['config']['batch_input_shape'] = [None, *input_shape]
         dd['config']['layers'][-1]['config']['units'] = n_classes
@@ -453,10 +522,15 @@ class LearnModel:
 
 
     @staticmethod
-    def create_model(config_path: UNIVERSAL_PATH_TYPE, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> Model:
-        """ Compile classify model """
+    def _create_model(config_path: UNIVERSAL_PATH_TYPE, input_shape: FRAME_SHAPE_TYPE, n_classes: int) -> Model:
+        """ Create, prepare and compile KEras classify model
+
+            :param config_path: Path to model json config
+            :param input_shape: Input train data shape
+            :param n_classes: Classes count
+        """
         with open(config_path,  'r') as f:
-            model_config = LearnModel.prepare_model(json.load(f), input_shape, n_classes)
+            model_config = LearnModel.__prepare_model(json.load(f), input_shape, n_classes)
             model = deserialize(model_config)
             model.compile(loss='categorical_crossentropy', optimizer='sgd', metrics=['accuracy'])
             return model
@@ -467,7 +541,7 @@ class LearnModel:
         model: Model,
         train_data: TRAIN_DATA_GEN_TYPE,
         X_test: TRAIN_DATA_TYPE = None,
-        Y_test: TRAIN_LABELS_TYPE = None,
+        y_test: TRAIN_LABELS_TYPE = None,
         epochs: int = 1,
         steps_per_epoch: Union[int, None] = None,
         shuffle: bool = True,
@@ -475,7 +549,17 @@ class LearnModel:
 
     ) -> Model:
 
-        """ Train and return fitted model """
+        """ Train and return fitted model
+
+            :param model: Configured Keras model object
+            :param train_data: Train data object (Keras <Sequence> or iterable with train data and labels)
+            :param X_test: Test data
+            :param y_test: Test labels
+            :param epochs: Count of epoch to learn
+            :param steps_per_epoch: Count of step in one train epoch
+            :param shuffle: Is shuffle train data ?
+            :param verbose_mode: Verbose learn output ?
+        """
 
         if isinstance(train_data, (Generator, KerasSequence)):
             model.fit_generator(generator=train_data, epochs=epochs, steps_per_epoch=steps_per_epoch, shuffle=shuffle, verbose=verbose_mode)
@@ -483,8 +567,8 @@ class LearnModel:
             X, y = ( np.array(tuple(collapse(x, levels=1))) for x in zip(*train_data) )
             model.fit(X, y, epochs=epochs, shuffle=shuffle, verbose=verbose_mode)
 
-        if X_test and Y_test:
-            model.evaluate(X_test, Y_test)
+        if X_test and y_test:
+            model.evaluate(X_test, y_test)
 
         return model
 
@@ -493,18 +577,27 @@ class LearnModel:
     def start_learn(
         train_data: TRAIN_DATA_GEN_TYPE,
         model_config_path: UNIVERSAL_PATH_TYPE,
-        camera_frame_shape: FRAME_SHAPE_TYPE,
+        camera_config: UNIVERSAL_CONFIG_TYPE,
+        learn_config: UNIVERSAL_CONFIG_TYPE,
         n_classes: int,
-        epoch: int = 1,
-        step_per_epoch: Union[int, None] = None,
-        shuffle: bool = True
+        verbose_mode: bool = True
 
     ) -> Model:
 
-        """ Fit learn model from training dataset """
+        """ Configure and fit model from training dataset
 
-        model = LearnModel.create_model(model_config_path, camera_frame_shape, n_classes)
-        return LearnModel.fit_model(model, train_data, epochs=epoch, steps_per_epoch=step_per_epoch, shuffle=shuffle)
+            :param train_data: Train data object (Keras <Sequence> or iterable with train data and labels)
+            :param camera_config: Camera config
+            :param learn_config: Learn process config
+            :param model_config_path: Path to json model config
+            :param n_classes: Count of different classes to learn model
+            :param verbose_mode: Verbose learn output ?
+        """
+
+        frame_shape = itemgetter('camera_frame_shape')(camera_config)
+        epochs, steps_per_epoch, shuffle = itemgetter('epochs', 'steps_per_epoch', 'shuffle')(learn_config)
+        model = LearnModel._create_model(model_config_path, frame_shape, n_classes)
+        return LearnModel.fit_model(model, train_data, epochs=epochs, steps_per_epoch=steps_per_epoch, shuffle=shuffle, verbose_mode=verbose_mode)
 
 
 
@@ -513,8 +606,15 @@ class PredictModel:
     """ Model learning and recognition processing """
 
     @staticmethod
-    def face_predict(model, label_mapping: Mapping, frame: np.ndarray, extracted_face: np.ndarray, face_coords: COORDS_TYPE) -> Sequence[np.ndarray]:
-        """ Predict extracted face and draw label with this name """
+    def _face_predict(model, label_mapping: Mapping, frame: np.ndarray, extracted_face: np.ndarray, face_coords: RectArea) -> np.ndarray:
+        """ Predict extracted face and draw label with this name
+
+            :param model: Trained Keras model
+            :param label_mapping: Mapping persons labels
+            :param frame: Current image frame
+            :param extracted_face: Part of frame with extracted face
+            :param face_coords: Coords of extracted face on current frame
+        """
 
         ### Predict label ###
         predicted_code = model.predict_classes( np.array([extracted_face]) )
@@ -526,16 +626,30 @@ class PredictModel:
         ### Draw person info ###
         for i, (k, v) in enumerate(predicted_meta.items()):
             msg = "{0}: {1}".format(k, v)
-            x, y, *_ = face_coords[2:4]
-            text = cv2.putText(frame, msg, (x, y-i*20), cv2.FONT_HERSHEY_TRIPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+            text = cv2.putText(frame, msg, (face_coords.x2, face_coords.y2-i*20), cv2.FONT_HERSHEY_TRIPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
             cv2.imshow('frame', text)
 
         return predicted_code
 
 
     @staticmethod
-    async def start_predict(persons_mapping: Mapping, camera: Mapping, model_path: str, haar_cascade_path: str, *, as_grayscale: bool = False) -> None:
-        """ Recognition faces from camera """
+    async def start_predict(
+        persons_mapping: UNIVERSAL_CONFIG_TYPE,
+        camera: UNIVERSAL_CONFIG_TYPE,
+        model_path: UNIVERSAL_PATH_TYPE,
+        haar_cascade_path: UNIVERSAL_PATH_TYPE,
+        *, as_grayscale: bool = False
+
+    ) -> None:
+
+        """ Extract and predict faces from each camera frame
+
+            :param persons_mapping: Mapping persons labels and metadata
+            :param camera: Camera config
+            :param model_path: Path to trained Keras model
+            :param haar_cascade_path: Path to Haar cascade config file
+            :param as_grayscale: Predict faces as grayscale
+        """
 
         camera_id = camera['camera_id']
         camera_frame_shape = tuple(camera['camera_frame_shape'])
@@ -543,17 +657,18 @@ class PredictModel:
 
         haar_face_cascade = cv2.CascadeClassifier(haar_cascade_path)
         model = load_model(model_path)
-        predict_func = partial(PredictModel.face_predict, model, persons_mapping)
+        predict_func = partial(PredictModel._face_predict, model, persons_mapping)
         cam = cv2.VideoCapture(camera_id)
-        cam.set(3, 800)
-        cam.set(4, 600)
+        # cam.set(3, 800)
+        # cam.set(4, 600)
+
         while True:
             _, frame = cam.read()
             cv2.imshow('frame', frame)
 
             faces_coords = ImageWorking.get_faces_area(haar_face_cascade, frame)
             if faces_coords:
-                first_face_coords = itemgetter(0, 1, 2, 3)(faces_coords[0])  ### Use first face only
+                first_face_coords = RectArea(*itemgetter(0, 1, 2, 3)(faces_coords[0]))  ### Use first face only
                 extracted_face = ImageWorking.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape, as_grayscale=as_grayscale)
                 predict_func(frame, extracted_face, first_face_coords)
 

@@ -30,6 +30,16 @@ SCHEMA_MAPPING = {
         "required": ["camera_id", "camera_close_key", "camera_frame_shape"]
     },
 
+    "learn": {
+        "type": "object",
+        "properties": {
+            "epochs": {"type": "integer"},
+            "shuffle": {"type": "boolean"},
+            "steps_per_epoch": {"type": ["integer", "null"]}
+        },
+        "required": ["epochs", "shuffle", "steps_per_epoch"]
+    },
+
     "model_config": {
         "type": "object",
         "properties": {
