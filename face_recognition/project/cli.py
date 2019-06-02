@@ -13,6 +13,7 @@ from face_recognition.project.schema import SCHEMA_MAPPING
 
 
 
+
 def main():
     parser = ArgumentParser()
     parser.add_argument('-m', '--mode', type=str, choices=['cutting', 'fit', 'predict', 'schema'], help='Program mode - create dataset from camera, fit model, predict faces or data input schema return')

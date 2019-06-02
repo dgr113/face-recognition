@@ -16,7 +16,7 @@ from operator import itemgetter, truth
 from collections import defaultdict, deque
 from dataclasses import dataclass, astuple, InitVar
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-from typing import Union, Mapping, Generator, Sequence, Tuple
+from typing import Union, Mapping, Generator, Sequence, Tuple, Callable
 from jsonschema import Draft4Validator
 from keras.layers import deserialize
 from keras.models import Model, load_model
@@ -99,6 +99,26 @@ class SystemUtils:
         if is_not_suppress:
             ch = stdout if ch == 'stdout' else stderr
             print(msg, *args, file=ch, **kwargs)
+
+
+    @staticmethod
+    async def run_executor_async(
+        func: Callable,
+        pool: Union[ThreadPoolExecutor, ProcessPoolExecutor] = None,
+        *args,
+        query_: Union[asyncio.Queue, None] = None,
+        **kwargs
+
+    ) -> Generator:
+
+        """ Wrap <run_in_executor> future into async coroutine (with Query data unpack support) """
+
+        loop = asyncio.get_running_loop()
+        if query_:
+            query_data = await query_.get()
+            func = partial(func, query_data)
+
+        return loop.run_in_executor(pool, partial(func, *args, **kwargs))
 
 
 
@@ -240,49 +260,59 @@ class ImageWorking:
 
 
     @staticmethod
-    def extract_frame_area(
-        img: np.ndarray,
-        coords: Union[RectArea, None] = None,
-        frame_reshape: Union[FRAME_SHAPE_TYPE, None] = None,
+    def extract_frame_areas(
+        frame: np.ndarray,
+        areas: Union[RectArea, Sequence[RectArea]],
+        area_shape: Union[FRAME_SHAPE_TYPE, None] = None,
         *, as_grayscale: bool = False
 
-    ) -> np.ndarray:
+    ) -> Sequence[np.ndarray]:
 
         """ Extract frame area with additional options
 
-            :param img: Image as a numpy array
-            :param coords: Rectangle coords [up_left_x, up_left_y, down_right_x, down_right_y]
-            :param frame_reshape: Shape for resizing image
+            :param frame: Image as a numpy array
+            :param areas: Rectangle coords [up_left_x, up_left_y, down_right_x, down_right_y]
+            :param area_shape: Shape for resizing image
             :param as_grayscale: Extract frame as grayscale
         """
 
-        frame_area = np.copy(img)
-
-        if coords:
-            x1, y1, x2, y2 = astuple(coords)
-            if y2 <= frame_area.shape[0] and x2 <= frame_area.shape[1]:
-                frame_area = ImageWorking._resize_frame(img[y1:y2, x1:x2], new_shape=frame_reshape[:2]) if frame_reshape else img[y1:y2, x1:x2]
+        results = []
+        for coord in always_iterable(areas):
+            x1, y1, x2, y2 = astuple(coord)
+            if area_shape:
+                frame_area = ImageWorking._resize_frame(frame[y1:y2, x1:x2], new_shape=tuple(area_shape[:2]))
             else:
-                SystemUtils.print_err('Error! Wrong area range to extract from image frame. Return original image...')
+                frame_area = frame[y1:y2, x1:x2]
 
-        if as_grayscale:
-            frame_area = cv2.cvtColor(frame_area, cv2.COLOR_BGR2GRAY)
-            frame_area = frame_area[:, :, np.newaxis]  ### Add an additional axis to indicate an empty color channel (for Tensorflow backend)
+            if as_grayscale:
+                frame_area = cv2.cvtColor(frame_area, cv2.COLOR_BGR2GRAY)
+                frame_area = frame_area[:, :, np.newaxis]  ### Add an additional axis to indicate an empty color channel (for Tensorflow backend)
+            results.append(frame_area)
 
-        return frame_area
+        return results
 
 
     @staticmethod
-    def get_faces_area(f_cascade: cv2.CascadeClassifier, img: np.ndarray, scaleFactor: float = 1.1) -> Sequence[COORDS_TYPE]:
-        """ Return extracted face coordinates
+    def get_faces_area(
+        face_cascade: Union[UNIVERSAL_PATH_TYPE, cv2.CascadeClassifier],
+        frame: np.ndarray,
+        scaleFactor: float = 1.1
 
-            :param f_cascade: Cascade classifier for extract face from image frame
-            :param img: Image frame
+    ) -> Sequence[COORDS_TYPE]:
+
+        """ Return extracted face coordinates (USE FOR ASYNC)
+
+            :param face_cascade: Cascade classifier (or path to it) for extract face from image frame
+            :param frame: Image frame
             :param scaleFactor: Scale factor for extract faces
         """
-        frame_area = np.copy(img)
+
+        if isinstance(face_cascade, (str, Path)):
+            face_cascade = cv2.CascadeClassifier(face_cascade)
+
+        frame_area = np.copy(frame)
         frame_area = cv2.cvtColor(frame_area, cv2.COLOR_BGR2GRAY)
-        faces = f_cascade.detectMultiScale(frame_area, scaleFactor=scaleFactor, minNeighbors=5)
+        faces = face_cascade.detectMultiScale(frame_area, scaleFactor=scaleFactor, minNeighbors=5)
         results = [ (x, y, (x+w), (y+h)) for (x, y, w, h) in faces ]
         return results
 
@@ -333,9 +363,9 @@ class HDF5Utils:
     @staticmethod
     def save_hdf5_train_images(
         chunked_data: CHUNKED_DATA_TYPE,
-        metadata: UNIVERSAL_CONFIG_TYPE,
+        data_path: UNIVERSAL_PATH_TYPE,
         image_shape: FRAME_SHAPE_TYPE,
-        data_path: UNIVERSAL_PATH_TYPE = './data.hdf5',
+        metadata: UNIVERSAL_CONFIG_TYPE,
         images_ds_name: str = 'X',
         labels_ds_name: str = 'y',
         metadata_ds_name: str = 'metadata'
@@ -375,23 +405,6 @@ class HDF5Utils:
             X[-new_X_len:] = images
             y[-new_y_len:] = labels
             hdf.flush()
-
-
-    @staticmethod
-    async def save_hdf5_train_images_async(
-        save_data_path: UNIVERSAL_PATH_TYPE,
-        q: asyncio.Queue,
-        image_frame_shape: FRAME_SHAPE_TYPE,
-        metadata: UNIVERSAL_CONFIG_TYPE,
-        pool: Union[ThreadPoolExecutor, ProcessPoolExecutor] = None
-
-    ) -> Generator:
-
-        """ Wrap <run_in_executor> future into async coroutine """
-
-        loop = asyncio.get_running_loop()
-        chunked_data = await q.get()
-        return loop.run_in_executor(pool, HDF5Utils.save_hdf5_train_images, chunked_data, metadata, image_frame_shape, save_data_path)
 
 
 
@@ -445,14 +458,19 @@ class TrainsetCreation:
                         first_face_coords = itemgetter(0, 1, 2, 3)(faces_coords[0])  ### Use first face only
                         first_face_coords = RectArea(*first_face_coords)
                         ImageWorking.draw_rect_area(frame, first_face_coords)
-                        frame_area = ImageWorking.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape, as_grayscale=as_grayscale)
+                        frame_area = first(ImageWorking.extract_frame_areas(frame, first_face_coords, camera_frame_shape, as_grayscale=as_grayscale))
 
                         ### If image buffer exceeds the limit or exit button is pressed - save the images asynchronously
                         if (shift > max_buffer_len) or not is_live:
                             q.put_nowait(chunked_data.copy())
-                            task = await asyncio.create_task(
-                                HDF5Utils.save_hdf5_train_images_async(save_data_path, q, camera_frame_shape, person, pool)
-                            )
+                            task = await asyncio.create_task(SystemUtils.run_executor_async(
+                                HDF5Utils.save_hdf5_train_images,
+                                pool,
+                                save_data_path,
+                                camera_frame_shape,
+                                person,
+                                query_=q
+                            ))
 
                             tasks.append(task)
                             chunked_data.clear()
@@ -604,30 +622,33 @@ class PredictModel:
     """ Model learning and recognition processing """
 
     @staticmethod
-    def _face_predict(model, label_mapping: Mapping, frame: np.ndarray, extracted_face: np.ndarray, face_coords: RectArea) -> np.ndarray:
+    def _face_predict(model, label_mapping: Mapping, frame: np.ndarray, faces: Sequence[np.ndarray], coords: Sequence[RectArea]) -> None:
         """ Predict extracted face and draw label with this name
 
             :param model: Trained Keras model
             :param label_mapping: Mapping persons labels
             :param frame: Current image frame
-            :param extracted_face: Part of frame with extracted face
-            :param face_coords: Coords of extracted face on current frame
+            :param faces: Extracted faces frames
+            :param coords: Extracted faces coords
         """
 
         ### Predict label ###
-        predicted_code = model.predict_classes( np.array([extracted_face]) )
-        predicted_meta = label_mapping.get(str(first(predicted_code, None)), {})
+        predicted_codes = model.predict_classes(np.array(faces))
+        predicted_metas = [
+            (coord, label_mapping.get(str(code), {}))
+            for code, coord in zip(predicted_codes, coords)
+        ]
 
         ### Draw face area ###
-        ImageWorking.draw_rect_area(frame, face_coords)
+        for face_coord in coords:
+            ImageWorking.draw_rect_area(frame, face_coord)
 
         ### Draw person info ###
-        for i, (k, v) in enumerate(predicted_meta.items()):
-            msg = "{0}: {1}".format(k, v)
-            text = cv2.putText(frame, msg, (face_coords.x2, face_coords.y2-i*20), cv2.FONT_HERSHEY_TRIPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
-            cv2.imshow('frame', text)
-
-        return predicted_code
+        for coord, meta in predicted_metas:
+            for i, (k, v) in enumerate(meta.items()):
+                msg = "{0}: {1}".format(k, v)
+                text = cv2.putText(frame, msg, (coord.x2, coord.y2-i*20), cv2.FONT_HERSHEY_TRIPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+                cv2.imshow('frame', text)
 
 
     @staticmethod
@@ -649,29 +670,39 @@ class PredictModel:
             :param as_grayscale: Predict faces as grayscale
         """
 
-        camera_id = camera['camera_id']
-        camera_frame_shape = tuple(camera['camera_frame_shape'])
-        camera_close_key = camera['camera_close_key']
-
-        haar_face_cascade = cv2.CascadeClassifier(haar_cascade_path)
+        camera_id, camera_frame_shape, camera_close_key = itemgetter('camera_id', 'camera_frame_shape', 'camera_close_key')(camera)
         model = load_model(model_path)
         predict_func = partial(PredictModel._face_predict, model, persons_mapping)
+
+        ### Start main cycle processing
         cam = cv2.VideoCapture(camera_id)
-        # cam.set(3, 800)
-        # cam.set(4, 600)
-
-        while True:
+        with ProcessPoolExecutor(1) as pool:
             _, frame = cam.read()
-            cv2.imshow('frame', frame)
 
-            faces_coords = ImageWorking.get_faces_area(haar_face_cascade, frame)
-            if faces_coords:
-                first_face_coords = RectArea(*itemgetter(0, 1, 2, 3)(faces_coords[0]))  ### Use first face only
-                extracted_face = ImageWorking.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape, as_grayscale=as_grayscale)
-                predict_func(frame, extracted_face, first_face_coords)
+            faces_coords = None
+            task = asyncio.create_task(SystemUtils.run_executor_async(ImageWorking.get_faces_area, pool, haar_cascade_path, frame))
+            while True:
+                _, frame = cam.read()
+                fut = await asyncio.wait_for(task, timeout=0.01)
 
-            if cv2.waitKey(30) == ord(camera_close_key):
-                break
+                ### If face area coordinates are obtained, use them
+                if fut.done():
+                    faces_coords = fut.result()
+                    if faces_coords:
+                        faces_coords = list(starmap(RectArea, faces_coords))
+                        extracted_faces = ImageWorking.extract_frame_areas(frame, faces_coords, camera_frame_shape, as_grayscale=as_grayscale)
+                        predict_func(frame, extracted_faces, faces_coords)
+                    task = asyncio.create_task(SystemUtils.run_executor_async(ImageWorking.get_faces_area, pool, haar_cascade_path, frame))
 
-        cam.release()
-        cv2.destroyAllWindows()
+                ### Else  - use buffered coordinates
+                elif faces_coords:
+                    extracted_faces = ImageWorking.extract_frame_areas(frame, faces_coords, camera_frame_shape, as_grayscale=as_grayscale)
+                    predict_func(frame, extracted_faces, faces_coords)
+
+                ### Draw frame
+                cv2.imshow('frame', frame)
+                if cv2.waitKey(30) == ord(camera_close_key):
+                    break
+
+            cam.release()
+            cv2.destroyAllWindows()

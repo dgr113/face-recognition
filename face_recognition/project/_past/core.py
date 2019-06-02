@@ -4,14 +4,16 @@ import cv2
 import json
 import h5py
 import logging
+import asyncio
 import numpy as np
 import tensorflow as tf
 from pathlib import Path
-from itertools import starmap
+from itertools import starmap, repeat
 from functools import partial
 from sys import stderr, stdout
 from operator import itemgetter
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures.process import ProcessPoolExecutor
 from typing import Union, Tuple, Mapping, Sequence, Any, Iterable, List, Dict
 from jsonschema import Draft4Validator
 from keras.layers import deserialize
@@ -254,21 +256,6 @@ class ProcessingUtils:
 
 
     @staticmethod
-    def save_data(path: str, images: Iterable[Iterable[np.array]], labels: Iterable[Iterable[int]], metas: Iterable[Mapping]) -> None:
-        """ Saves compressed images as HDF5 datasets """
-
-        with h5py.File(path, 'w') as hdf:
-            stages_results = zip(images, labels, metas)
-            for stage_images, stage_labels, stage_meta in stages_results:
-                [group_label], group_labels = spy(stage_labels)
-
-                g = hdf.create_group(str(group_label))
-                g.create_dataset(name='X', data=stage_images, compression="gzip", compression_opts=9)
-                g.create_dataset(name='y', data=stage_labels, compression="gzip", compression_opts=9)
-                g.create_dataset('metadata', data=json.dumps(stage_meta))
-
-
-    @staticmethod
     def face_predict(
         model,
         label_mapping: Mapping,
@@ -296,47 +283,106 @@ class ProcessingUtils:
 
 
     @staticmethod
-    def stage_learn_processing(
+    def save_hdf5(
+        images: Sequence[np.array],
+        labels: Sequence[int],
+        person: Mapping,
+        image_shape=(3, 3),
+        storage_path: str = './data.hdf5',
+        images_ds_name: str = 'X',
+        labels_ds_name: str = 'y',
+        metadata_ds_name: str = 'metadata'
+
+    ) -> None:
+
+        """ Chunked and incremental saving data in HDF5 """
+
+        with h5py.File(storage_path, 'a') as hdf:
+            new_X_len, new_y_len = map(len, [images, labels])
+            [group_label], group_labels = spy(labels)
+            person_group_name = str(group_label)
+
+            if person_group_name not in hdf:
+                g = hdf.create_group(person_group_name)
+                X = g.create_dataset(images_ds_name, (0, *image_shape), chunks=(*image_shape, 1), maxshape=(None, *image_shape))
+                y = g.create_dataset(labels_ds_name, (0,), chunks=(1,), maxshape=(None,))
+                g.create_dataset(metadata_ds_name, data=json.dumps(person))
+            else:
+                X = hdf[person_group_name][images_ds_name]
+                y = hdf[person_group_name][labels_ds_name]
+
+            X.resize(X.shape[0]+new_X_len, axis=0)
+            y.resize(y.shape[0]+new_y_len, axis=0)
+            X[-new_X_len:] = images
+            y[-new_y_len:] = labels
+            hdf.flush()
+
+
+    @staticmethod
+    async def stage_learn_processing(
         camera_id: int,
         camera_close_key: str,
         haar_face_cascade: cv2.CascadeClassifier,
         camera_frame_shape: Tuple[int, ...],
-        curr_label: int
+        curr_label: int,
+        person: Mapping,
+        save_data_path: str,
+        max_buffer_len: int = 1E2,
+        max_queue_size: int = 1E3
 
-    ) -> Tuple[list, list]:
+    ) -> None:
 
         """ One Person processing """
 
-        stage_images, stage_labels = [], []
         cam = cv2.VideoCapture(camera_id)
-        try:
-            while True:
-                _, frame = cam.read()
-                faces_coords = ImageUtils.get_faces_area(haar_face_cascade, frame)
-                if faces_coords.any():
-                    first_face_coords = itemgetter(0, 1, 2, 3)(faces_coords[0])  ### Use first face only
+        loop = asyncio.get_running_loop()
 
-                    ### Draw frame ###
-                    DrawUtils.draw_face_area(frame, first_face_coords)
-                    cv2.imshow('frame', frame)
+        with ProcessPoolExecutor(1) as pool:
+            images, labels = deque(maxlen=max_queue_size), deque(maxlen=max_queue_size)
+            try:
+                fut = None
+                shift = 0
+                while True:
+                    _, frame = cam.read()
+                    faces_coords = ImageUtils.get_faces_area(haar_face_cascade, frame)
+                    if faces_coords.any():
+                        first_face_coords = itemgetter(0, 1, 2, 3)(faces_coords[0])  ### Use first face only
+                        DrawUtils.draw_face_area(frame, first_face_coords)
+                        frame_area = ImageUtils.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape)
+                        images.append(frame_area)
+                        labels.append(curr_label)
 
-                    ### Append results into "learn pack" ###
-                    frame_area = ImageUtils.extract_frame_area(frame, first_face_coords, frame_reshape=camera_frame_shape)
-                    stage_images.append(frame_area)
-                    stage_labels.append(curr_label)
+                        if shift > max_buffer_len:
+                            fut = loop.run_in_executor(pool, ProcessingUtils.save_hdf5, images[-shift:], labels[-shift:], person, camera_frame_shape, save_data_path)
+                        elif fut and fut.done():
+                            images.clear()
+                            labels.clear()
+                            shift = 0
+                        else:
+                            shift += 1
 
-                ### Do not use non-latin keyboard layout (may assert error)
-                if cv2.waitKey(30) == ord(camera_close_key):
-                    break
+                    ### Do not use non-latin keyboard layout (may assert error)
+                    if cv2.waitKey(30) == ord(camera_close_key):
+                        await loop.run_in_executor(pool, ProcessingUtils.save_hdf5, images, labels, person, camera_frame_shape, save_data_path)
+                        break
+                    else:
+                        cv2.imshow('frame', frame)
 
-        finally:
-            cv2.destroyAllWindows()
-            cam.release()
-            return stage_images, stage_labels
+            finally:
+                cv2.destroyAllWindows()
+                cam.release()
 
 
     @staticmethod
-    def start_learn(persons: Sequence[Mapping], camera: Mapping, model_config_path: str, haar_cascade_path: str, save_data_path: Union[str, None] = None) -> Model:
+    def start_learn(
+        persons: Sequence[Mapping],
+        camera: Mapping,
+        model_config_path: str,
+        haar_cascade_path: str,
+        save_data_path: Union[str, None] = None
+
+    ) -> Model:
+
         """ Learn model by faces from camera """
 
         camera_id = camera['camera_id']
@@ -347,25 +393,17 @@ class ProcessingUtils:
         haar_face_cascade = cv2.CascadeClassifier(haar_cascade_path)
         model = ClassifyUtils.create_model(model_config_path, camera_frame_shape, n_classes)
 
-        images, labels = [], []
         for label, person in enumerate(persons):
             inp_msg = "{0} {1}, are you ready? [Y/n]: ".format(*map(str.capitalize, always_iterable(itemgetter('first_name', 'last_name')(person))))
             inp_val = input(inp_msg)
-
             if inp_val.lower() == 'y':
-                stage_images, stage_labels = ProcessingUtils.stage_learn_processing(camera_id, camera_close_key, haar_face_cascade, camera_frame_shape, label)
-                images.append(stage_images)
-                labels.append(stage_labels)
+                asyncio.run(ProcessingUtils.stage_learn_processing(camera_id, camera_close_key, haar_face_cascade, camera_frame_shape, label, person, save_data_path))
 
-        ### Save data if needed
-        if save_data_path:
-            ProcessingUtils.save_data(save_data_path, images, labels, persons)
-
-        ### Learn models
-        images = np.array(tuple(collapse(images, levels=1)))
-        dummy_labels = to_categorical(tuple(collapse(labels, levels=1)))
-        fitted_model = ClassifyUtils.fit_model(model=model, X_train=images, Y_train=dummy_labels)
-        return fitted_model
+        # ### Learn models
+        # images = np.array(tuple(collapse(images, levels=1)))
+        # dummy_labels = to_categorical(tuple(collapse(labels, levels=1)))
+        # fitted_model = ClassifyUtils.fit_model(model=model, X_train=images, Y_train=dummy_labels)
+        # return fitted_model
 
 
     @staticmethod
